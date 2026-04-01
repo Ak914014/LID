@@ -1,0 +1,12 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+pydantic==2.8.2
+pydantic-settings==2.4.0
+
+numpy==1.26.4
+scipy==1.11.4
+
+rdkit-pypi==2022.9.5
+MDAnalysis==2.7.0
+prolif==2.0.3
