@@ -3,6 +3,7 @@ import tempfile
 import numpy as np
 from scipy.interpolate import splprep, splev
 from scipy.optimize import linear_sum_assignment
+from scipy.spatial import ConvexHull
 
 from rdkit import Chem
 from rdkit.Chem import AllChem, Draw
@@ -273,7 +274,7 @@ def classify_residue(resname: str) -> str:
 # RDKit SVG + 2D coordinates
 # =========================
 
-def rdkit_svg(mol: Chem.Mol, w: int = 820, h: int = 520) -> str:
+def rdkit_svg(mol: Chem.Mol, w: int = 820, h: int = 300) -> str:
     if not mol.GetNumConformers():
         AllChem.Compute2DCoords(mol)
     drawer = Draw.rdMolDraw2D.MolDraw2DSVG(w, h)
@@ -768,44 +769,71 @@ def pocket_outline_path(res_nodes, center_xy, base_r=190, thickness=55):
     return d
 
 
-def pocket_outline_ligand_hug(
+def _pocket_disk_sample_hull_points(
     ligand_atom_xy: list[dict],
-    lig_center: np.ndarray,
-    residue_xy: list[tuple[float, float]],
-    margin_px: float = 18.0,
-    angle_step_deg: float = 3.0,
-    sector_half_deg: float = 30.0,
-    max_hull_res_dist_px: float = 220.0,
-) -> str:
+    margin_px: float,
+    atom_radius_px: float,
+    samples_per_atom: int,
+) -> np.ndarray:
     """
-    Maestro-like pocket: contour hugs the ligand (expanded by margin_px). The path is split
-    into open segments with gaps where no pocket residue sits in that angular sector — so
-    solvent-exposed parts of the ligand have no boundary line (ligand \"out of cavity\").
+    Outer envelope of unions of disks around each atom ≈ smooth “SAS-like” outline in 2D.
+    Convex hull of dense circle samples avoids the straight-edged hull of atom centers alone.
     """
-    if not ligand_atom_xy:
-        return ""
-    L = np.array([float(lig_center[0]), float(lig_center[1])], dtype=float)
     atoms = np.array([[float(p["x"]), float(p["y"])] for p in ligand_atom_xy], dtype=float)
-    res_pts = np.array(residue_xy, dtype=float) if residue_xy else np.zeros((0, 2), dtype=float)
+    n_atom = atoms.shape[0]
+    if n_atom == 0:
+        return np.zeros((0, 2), dtype=float)
+    R = float(margin_px + atom_radius_px)
+    if n_atom == 1:
+        t = np.linspace(0.0, 2.0 * np.pi, max(samples_per_atom, 12), endpoint=False)
+        return np.stack(
+            [atoms[0, 0] + R * np.cos(t), atoms[0, 1] + R * np.sin(t)],
+            axis=1,
+        )
+    k = max(int(samples_per_atom), 12)
+    thetas = np.linspace(0.0, 2.0 * np.pi, k, endpoint=False)
+    blocks: list[np.ndarray] = []
+    for i in range(n_atom):
+        cx, cy = float(atoms[i, 0]), float(atoms[i, 1])
+        blocks.append(
+            np.stack([cx + R * np.cos(thetas), cy + R * np.sin(thetas)], axis=1)
+        )
+    all_pts = np.vstack(blocks)
+    try:
+        hull = ConvexHull(all_pts)
+    except Exception:
+        return all_pts
+    return np.asarray(all_pts[np.asarray(hull.vertices, dtype=int)], dtype=float)
 
-    step = np.deg2rad(angle_step_deg)
-    thetas = np.arange(0.0, 2.0 * np.pi, step)
-    n = len(thetas)
-    if n < 8:
-        return ""
 
-    hull_pts = np.zeros((n, 2), dtype=float)
+def _closed_curve_from_hull_polyline(hp: np.ndarray, n_eval: int, s_scale: float) -> np.ndarray:
+    """Periodic B-spline through ordered hull vertices → dense smooth closed polyline."""
+    if hp.shape[0] < 3:
+        return hp
+    # small periodic smoothing: follows wavy outline without collapsing to a blob
+    s = max(float(hp.shape[0]) * float(s_scale), 0.5)
+    try:
+        tck, _ = splprep([hp[:, 0], hp[:, 1]], s=s, per=True)
+    except Exception:
+        return hp
+    uu = np.linspace(0.0, 1.0, int(n_eval), endpoint=False)
+    xs, ys = splev(uu, tck)
+    return np.stack([xs, ys], axis=1)
+
+
+def _buried_mask_for_pocket_points(
+    curve_pts: np.ndarray,
+    L: np.ndarray,
+    res_pts: np.ndarray,
+    sector_half_deg: float,
+    max_hull_res_dist_px: float,
+) -> np.ndarray:
+    n = curve_pts.shape[0]
     buried = np.zeros(n, dtype=bool)
     half_w = np.deg2rad(sector_half_deg)
-
-    for i, th in enumerate(thetas):
-        u = np.array([np.cos(th), np.sin(th)], dtype=float)
-        rel = atoms - L
-        proj = rel @ u
-        max_proj = float(proj.max()) + float(margin_px)
-        H = L + u * max_proj
-        hull_pts[i] = H
-
+    for i in range(n):
+        P = curve_pts[i]
+        th = float(np.arctan2(P[1] - L[1], P[0] - L[0]))
         ok = False
         for j in range(res_pts.shape[0]):
             d = res_pts[j] - L
@@ -814,53 +842,39 @@ def pocket_outline_ligand_hug(
             ang = float(np.arctan2(d[1], d[0]))
             da = (ang - th + np.pi) % (2.0 * np.pi) - np.pi
             if abs(da) < half_w:
-                if np.linalg.norm(res_pts[j] - H) <= max_hull_res_dist_px:
+                if np.linalg.norm(res_pts[j] - P) <= max_hull_res_dist_px:
                     ok = True
                     break
         buried[i] = ok
+    return buried
 
-    if not np.any(buried):
-        return ""
 
-    # Collect contiguous runs on the circle (handle wrap)
-    idx_b = np.where(buried)[0]
+def _circular_runs(mask: np.ndarray) -> list[list[int]]:
+    n = int(mask.size)
+    idx_b = np.where(mask)[0]
     if len(idx_b) == 0:
-        return ""
-
-    # Build runs of consecutive indices (circular)
+        return []
     runs: list[list[int]] = []
-    cur = [idx_b[0]]
+    cur = [int(idx_b[0])]
     for k in range(1, len(idx_b)):
-        prev_i = idx_b[k - 1]
-        this_i = idx_b[k]
+        prev_i = int(idx_b[k - 1])
+        this_i = int(idx_b[k])
         if this_i == prev_i + 1 or (prev_i == n - 1 and this_i == 0):
             cur.append(this_i)
         else:
             runs.append(cur)
             cur = [this_i]
     runs.append(cur)
-
-    # Merge first and last run if both touch across 0 angle
     if len(runs) >= 2:
         first, last = runs[0], runs[-1]
         if first[0] == 0 and last[-1] == n - 1:
             runs[-1] = last + first
             runs.pop(0)
-
-    path_chunks: list[str] = []
-    for run in runs:
-        if len(run) < 2:
-            continue
-        pts = hull_pts[run]
-        chunk = _hull_segment_to_svg_path(pts)
-        if chunk:
-            path_chunks.append(chunk)
-
-    return " ".join(path_chunks)
+    return runs
 
 
 def _hull_segment_to_svg_path(pts: np.ndarray) -> str:
-    """Smooth open path through ordered 2D points."""
+    """Smooth open path through ordered 2D points (tight fit + dense eval = curved, not faceted)."""
     if pts.shape[0] < 2:
         return ""
     if pts.shape[0] == 2:
@@ -874,10 +888,11 @@ def _hull_segment_to_svg_path(pts: np.ndarray) -> str:
             f"L {pts[1, 0]:.1f} {pts[1, 1]:.1f} "
             f"L {pts[2, 0]:.1f} {pts[2, 1]:.1f}"
         )
-    smoothing = max(float(pts.shape[0]) * 0.35, 2.0)
+    # Low s: follow the wavy outline; many samples: visually smooth, not straight chords
+    smoothing = max(float(pts.shape[0]) * 0.06, 0.8)
     try:
         tck, _ = splprep([pts[:, 0], pts[:, 1]], s=smoothing, per=False)
-        uu = np.linspace(0, 1, max(28, pts.shape[0] * 5))
+        uu = np.linspace(0, 1, max(48, min(220, pts.shape[0] * 6)))
         xs, ys = splev(uu, tck)
     except Exception:
         parts = [f"M {pts[0, 0]:.1f} {pts[0, 1]:.1f}"]
@@ -888,6 +903,78 @@ def _hull_segment_to_svg_path(pts: np.ndarray) -> str:
     out = f"M {xs[0]:.1f} {ys[0]:.1f} "
     out += " ".join([f"L {x:.1f} {y:.1f}" for x, y in zip(xs[1:], ys[1:])])
     return out
+
+
+def _closed_hull_curve_to_svg_path(curve: np.ndarray) -> str:
+    """Closed SVG path: dense smooth loop hugging the ligand (Maestro-style pocket band)."""
+    if curve.shape[0] < 2:
+        return ""
+    xs = curve[:, 0]
+    ys = curve[:, 1]
+    parts = [f"M {xs[0]:.1f} {ys[0]:.1f}"]
+    for i in range(1, xs.shape[0]):
+        parts.append(f"L {xs[i]:.1f} {ys[i]:.1f}")
+    parts.append("Z")
+    return " ".join(parts)
+
+
+def pocket_outline_ligand_hug(
+    ligand_atom_xy: list[dict],
+    lig_center: np.ndarray,
+    residue_xy: list[tuple[float, float]],
+    margin_px: float = 12.0,
+    atom_radius_px: float = 9.0,
+    samples_per_atom: int = 26,
+    curve_eval_points: int = 320,
+    closed_spline_s: float = 0.12,
+    sector_half_deg: float = 28.0,
+    max_hull_res_dist_px: float = 280.0,
+    continuous_band: bool = True,
+) -> str:
+    """
+    Pocket outline: smooth closed band following the ligand silhouette (union-of-disks hull + spline).
+
+    When continuous_band is True (default), the full contour is always drawn—irregular shape
+    around rings/tails like Maestro, and the pocket is never dropped when residue positions
+    do not match the old “buried sector” mask.
+
+    When continuous_band is False, only arc segments with a nearby residue (solvent gaps) are
+    drawn, matching the previous behaviour.
+    """
+    if not ligand_atom_xy:
+        return ""
+    L = np.array([float(lig_center[0]), float(lig_center[1])], dtype=float)
+    res_pts = np.array(residue_xy, dtype=float) if residue_xy else np.zeros((0, 2), dtype=float)
+
+    hp = _pocket_disk_sample_hull_points(ligand_atom_xy, margin_px, atom_radius_px, samples_per_atom)
+    if hp.shape[0] < 3:
+        return ""
+
+    curve = _closed_curve_from_hull_polyline(hp, n_eval=curve_eval_points, s_scale=closed_spline_s)
+
+    if continuous_band:
+        return _closed_hull_curve_to_svg_path(curve)
+
+    if res_pts.shape[0] == 0:
+        buried = np.ones(curve.shape[0], dtype=bool)
+    else:
+        buried = _buried_mask_for_pocket_points(curve, L, res_pts, sector_half_deg, max_hull_res_dist_px)
+
+    if not np.any(buried):
+        return _closed_hull_curve_to_svg_path(curve)
+
+    runs = _circular_runs(buried)
+    path_chunks: list[str] = []
+    for run in runs:
+        if len(run) < 2:
+            continue
+        pts = curve[np.array(run, dtype=int)]
+        chunk = _hull_segment_to_svg_path(pts)
+        if chunk:
+            path_chunks.append(chunk)
+
+    segmented = " ".join(path_chunks)
+    return segmented if segmented.strip() else _closed_hull_curve_to_svg_path(curve)
 
 
 # =========================
@@ -1134,13 +1221,15 @@ def build_diagram(
     # 6) Generate curved backbone path connecting consecutive residues in sequence order
     backbone_path = generate_backbone_path(residues, lig_center)
 
-    # 7) Pocket: tight contour around ligand + gaps where no residue caps that direction
+    # 7) Pocket: full ligand-hugging closed contour (gradient stroke in frontend)
     outline = pocket_outline_ligand_hug(
         ligand_atom_xy,
         lig_center,
         [(float(r["x"]), float(r["y"])) for r in residues],
-        margin_px=16.0,
-        angle_step_deg=3.0,
+        margin_px=14.0,
+        atom_radius_px=9.0,
+        samples_per_atom=26,
+        curve_eval_points=320,
         sector_half_deg=28.0,
         max_hull_res_dist_px=280.0,
     )

@@ -1,28 +1,29 @@
-import React from "react";
+import React, { Suspense } from "react";
 import { useSelector } from "react-redux";
 import UploadPanel from "./components/UploadPanel";
-import NglViewer from "./components/NglViewer";
 import Interaction2D from "./components/Interaction2D";
+
+// const MolstarViewer = React.lazy(() => import("./components/MolstarViewer"));
 
 function App() {
   const { data } = useSelector((state) => state.diagram);
 
   return (
-    <div style={{ padding: 200, flexDirection: "row", display: "flex", gap: 20 }}>
-      {/* <h2>Protein–Ligand Pocket Viewer</h2> */}
-
+    <div
+     className="p-4 flex  gap-"
+    >
       <UploadPanel />
 
-      {data && (
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
-       {/* <NglViewer
-  pdbUrl={data.pdb_url}
-  ligandResname={data.meta.ligand_resname} // should be UNL
-  pocketRadius={data.meta.pocket_radius}
-/> */}
+      
+        <div
+          
+        >
+          {data && (
           <Interaction2D data={data} />
+          
+        )}
         </div>
-      )}
+      
     </div>
   );
 }

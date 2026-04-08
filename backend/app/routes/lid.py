@@ -18,8 +18,8 @@ async def generate_lid(
     ligand_name: Optional[str] = Query(None, description="Ligand residue name (optional)"),
     model_index: int = Query(1, ge=1, description="Pose/model index from MODEL/ENDMDL"),
     pocket_radius: float = Query(5.0),
-    svg_w: int = Query(820),
-    svg_h: int = Query(520),
+    svg_w: int = Query(600),
+    svg_h: int = Query(600),
 ):
     try:
         pdb_bytes = await protein_ligand_pdb.read()
