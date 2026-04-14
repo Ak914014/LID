@@ -1,3 +1,4 @@
+import logging
 import os
 import tempfile
 import numpy as np
@@ -7,12 +8,15 @@ from scipy.spatial import ConvexHull
 
 from rdkit import Chem
 from rdkit.Chem import AllChem, Draw
+from app.services.ai_interaction_service import rank_and_filter_interactions
 
 import MDAnalysis as mda
 try:
     import prolif as plf
 except ImportError:  # pragma: no cover - optional runtime dependency
     plf = None
+
+logger = logging.getLogger(__name__)
 
 
 # =========================
@@ -669,74 +673,195 @@ def place_residues_ring(u: mda.Universe, ligand_resname: str, pocket_radius: flo
     return res_nodes
 
 
+def _point_at_arc_fraction_closed(poly: np.ndarray, t: float) -> np.ndarray:
+    """Point at fraction t ∈ [0,1) along closed polyline (arc length)."""
+    M = int(poly.shape[0])
+    if M < 2:
+        return poly[0].astype(float).copy()
+    seg_lens: list[float] = []
+    for i in range(M):
+        a = poly[i]
+        b = poly[(i + 1) % M]
+        seg_lens.append(float(np.hypot(b[0] - a[0], b[1] - a[1])))
+    total = float(sum(seg_lens))
+    if total < 1e-9:
+        return poly[0].astype(float).copy()
+    dist = (float(t) % 1.0) * total
+    acc = 0.0
+    for i in range(M):
+        sl = seg_lens[i]
+        if acc + sl >= dist - 1e-9:
+            alpha = (dist - acc) / sl if sl > 1e-9 else 0.0
+            a = poly[i]
+            b = poly[(i + 1) % M]
+            return a + alpha * (b - a)
+        acc += sl
+    return poly[0].astype(float).copy()
+
+
+def _offset_closed_curve_radially(
+    curve: np.ndarray,
+    lig_center: np.ndarray,
+    outward_px: float,
+) -> np.ndarray:
+    """Push each sample outward from ligand center (room for labels outside pocket band)."""
+    L = np.asarray(lig_center, dtype=float).reshape(2)
+    out = np.zeros_like(curve, dtype=float)
+    d = float(outward_px)
+    for i in range(curve.shape[0]):
+        P = curve[i]
+        v = P - L
+        nv = float(np.linalg.norm(v))
+        if nv < 1e-9:
+            out[i] = P
+        else:
+            out[i] = P + (v / nv) * d
+    return out
+
+
+def _resolve_xy_overlaps(
+    xy: np.ndarray,
+    lig_center: np.ndarray,
+    min_dist: float,
+    push_px: float = 14.0,
+    max_iter: int = 36,
+) -> np.ndarray:
+    """Push nodes apart radially when labels overlap."""
+    out = np.array(xy, dtype=float, copy=True)
+    L = np.asarray(lig_center, dtype=float).reshape(2)
+    n = out.shape[0]
+    for _ in range(max_iter):
+        moved = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = float(np.linalg.norm(out[i] - out[j]))
+                if d >= min_dist or d < 1e-9:
+                    continue
+                for k in (i, j):
+                    v = out[k] - L
+                    nv = float(np.linalg.norm(v)) or 1.0
+                    out[k] = out[k] + (v / nv) * push_px
+                moved = True
+        if not moved:
+            break
+    return out
+
+
+def compute_residue_positions_on_pocket_offset(
+    ligand_atom_xy: list[dict],
+    lig_center: np.ndarray,
+    n_residues: int,
+    margin_px: float = 14.0,
+    atom_radius_px: float = 9.0,
+    residue_outward_px: float = 54.0,
+    curve_eval_points: int = 520,
+    closed_spline_s: float = 0.1,
+) -> np.ndarray | None:
+    """
+    Place residue centers on a loop parallel to the ligand pocket (union-of-disks hull),
+    just outside the coloured pocket band — fills the gap vs a circular residue ring.
+    Returns (n, 2) float array or None if geometry cannot be built.
+    """
+    if n_residues < 1 or not ligand_atom_xy:
+        return None
+    hp = _pocket_disk_sample_hull_points(
+        ligand_atom_xy,
+        margin_px,
+        atom_radius_px,
+        samples_per_atom=26,
+    )
+    if hp.shape[0] < 3:
+        return None
+    curve = _closed_curve_from_hull_polyline(
+        hp, n_eval=max(curve_eval_points, n_residues * 24), s_scale=closed_spline_s
+    )
+    offset_loop = _offset_closed_curve_radially(curve, lig_center, residue_outward_px)
+    xy = np.zeros((n_residues, 2), dtype=float)
+    for i in range(n_residues):
+        t = (i + 0.5) / float(n_residues)
+        xy[i] = _point_at_arc_fraction_closed(offset_loop, t)
+    return xy
+
+
+def _smooth_backbone_subpath_from_points(pts_array: np.ndarray) -> str:
+    """Single open stroke: smooth spline through ordered points (one contiguous sequence run)."""
+    if len(pts_array) < 2:
+        return ""
+    if len(pts_array) == 2:
+        return (
+            f"M {pts_array[0][0]:.1f} {pts_array[0][1]:.1f} "
+            f"L {pts_array[1][0]:.1f} {pts_array[1][1]:.1f}"
+        )
+    # splprep requires m > k (point count > spline degree)
+    n = len(pts_array)
+    k = min(3, max(1, n - 1))
+    smoothing = max(n * 1.15, 12.0)
+    tck, _ = splprep(
+        [pts_array[:, 0], pts_array[:, 1]], s=float(smoothing), per=False, k=k
+    )
+    uu = np.linspace(0, 1, max(220, len(pts_array) * 18))
+    xs, ys = splev(uu, tck)
+    path_d = f"M {xs[0]:.1f} {ys[0]:.1f} "
+    path_d += " ".join([f"L {x:.1f} {y:.1f}" for x, y in zip(xs[1:], ys[1:])])
+    return path_d
+
+
 def generate_backbone_path(residues, lig_center):
     """
-    Generate a smooth curved backbone path connecting consecutive residues in sequence order.
-    Only connects residues that are consecutive (resid N and N+1) within the same chain.
+    Generate smooth curved backbone strokes for sequence-contiguous segments only.
+
+    Residues are grouped by chain, sorted by resid, then split into maximal runs where
+    each step is resid N → N+1. Each run is drawn as its own SVG subpath (new ``M``).
+    Gaps in sequence (e.g. …185, 187… or …187, 200…) break the line — a single spline
+    must not bridge across missing residues.
     """
     if not residues or len(residues) < 2:
         return ""
-    
-    # Group residues by chain
-    residues_by_chain = {}
+
+    residues_by_chain: dict = {}
     for r in residues:
-        # Normalize chain - handle ".000", empty string, null, etc.
         chain = r.get("chain", "A")
-        if not chain or chain.strip() == "" or chain == ".000":
+        if not chain or str(chain).strip() == "" or chain == ".000":
             chain = "A"
-        
-        if chain not in residues_by_chain:
-            residues_by_chain[chain] = []
-        residues_by_chain[chain].append(r)
-    
-    # Collect all consecutive residue pairs
-    backbone_points = []
-    
+        residues_by_chain.setdefault(chain, []).append(r)
+
+    subpaths: list[str] = []
+
     for chain in sorted(residues_by_chain.keys()):
-        chain_residues = residues_by_chain[chain]
-        # Sort by resid
-        chain_residues.sort(key=lambda r: int(r.get("resid", 0)))
-        
-        # Find consecutive pairs and collect their positions
-        for i in range(len(chain_residues) - 1):
-            curr = chain_residues[i]
-            next_res = chain_residues[i + 1]
-            
-            curr_resid = int(curr.get("resid", 0))
-            next_resid = int(next_res.get("resid", 0))
-            
-            # Only connect if consecutive (N and N+1)
-            if next_resid - curr_resid == 1:
-                # Use the residue positions (they're already placed)
-                if "x" in curr and "y" in curr and "x" in next_res and "y" in next_res:
-                    # Add both points for the segment
-                    if not backbone_points or (backbone_points[-1][0] != curr["x"] or backbone_points[-1][1] != curr["y"]):
-                        backbone_points.append((float(curr["x"]), float(curr["y"])))
-                    backbone_points.append((float(next_res["x"]), float(next_res["y"])))
-    
-    if len(backbone_points) < 2:
-        return ""
-    
-    # Create smooth spline curve through the points
-    pts_array = np.array(backbone_points, dtype=float)
-    
-    # If we have enough points, create a smooth spline
-    if len(pts_array) >= 3:
-        # Fit spline with moderate smoothing - curve should pass close to residue positions
-        # Lower s value = curve passes closer to points, higher = smoother but may deviate
-        smoothing = max(len(pts_array) * 2, 20)  # Moderate smoothing
-        tck, _ = splprep([pts_array[:, 0], pts_array[:, 1]], s=smoothing, per=False)
-        # Generate smooth curve points - more points for smoother appearance
-        uu = np.linspace(0, 1, max(150, len(pts_array) * 15))
-        xs, ys = splev(uu, tck)
-        
-        # Create SVG path with smooth curve
-        path_d = f"M {xs[0]:.1f} {ys[0]:.1f} "
-        path_d += " ".join([f"L {x:.1f} {y:.1f}" for x, y in zip(xs[1:], ys[1:])])
-        return path_d
-    else:
-        # For 2 points, just draw a line
-        return f"M {pts_array[0][0]:.1f} {pts_array[0][1]:.1f} L {pts_array[1][0]:.1f} {pts_array[1][1]:.1f}"
+        chain_residues = sorted(
+            residues_by_chain[chain],
+            key=lambda r: int(r.get("resid", 0)),
+        )
+        if len(chain_residues) < 2:
+            continue
+
+        run_start = 0
+        for i in range(1, len(chain_residues)):
+            prev_id = int(chain_residues[i - 1].get("resid", 0))
+            curr_id = int(chain_residues[i].get("resid", 0))
+            if curr_id - prev_id != 1:
+                segment = chain_residues[run_start:i]
+                if len(segment) >= 2:
+                    pts = [
+                        (float(r["x"]), float(r["y"]))
+                        for r in segment
+                        if "x" in r and "y" in r
+                    ]
+                    if len(pts) >= 2:
+                        subpaths.append(_smooth_backbone_subpath_from_points(np.array(pts, dtype=float)))
+                run_start = i
+
+        segment = chain_residues[run_start:]
+        if len(segment) >= 2:
+            pts = [
+                (float(r["x"]), float(r["y"]))
+                for r in segment
+                if "x" in r and "y" in r
+            ]
+            if len(pts) >= 2:
+                subpaths.append(_smooth_backbone_subpath_from_points(np.array(pts, dtype=float)))
+
+    return " ".join(p for p in subpaths if p)
 
 
 def pocket_outline_path(res_nodes, center_xy, base_r=190, thickness=55):
@@ -769,6 +894,53 @@ def pocket_outline_path(res_nodes, center_xy, base_r=190, thickness=55):
     return d
 
 
+def _pocket_disk_union_boundary_points(
+    ligand_atom_xy: list[dict],
+    margin_px: float,
+    atom_radius_px: float,
+    buffer_quad_segs: int = 28,
+) -> np.ndarray | None:
+    """
+    True boundary of ∪ disks around atoms (preserves concavities / “bays” between groups).
+
+    This matches Maestro-style shrink-wrap around the ligand silhouette; unlike ConvexHull,
+    indentations between functional groups are kept.
+    """
+    try:
+        from shapely.geometry import Point
+        from shapely.ops import unary_union
+    except ImportError:
+        return None
+
+    if not ligand_atom_xy:
+        return np.zeros((0, 2), dtype=float)
+
+    R = float(margin_px + atom_radius_px)
+    polys = [
+        Point(float(p["x"]), float(p["y"])).buffer(R, quad_segs=max(8, buffer_quad_segs))
+        for p in ligand_atom_xy
+    ]
+    try:
+        u = unary_union(polys)
+    except Exception:
+        return None
+
+    if u.is_empty:
+        return None
+
+    if u.geom_type == "Polygon":
+        geom = u
+    elif u.geom_type == "MultiPolygon":
+        geom = max(u.geoms, key=lambda g: float(g.area))
+    else:
+        return None
+
+    coords = np.asarray(geom.exterior.coords, dtype=float)
+    if coords.shape[0] > 1 and np.allclose(coords[0], coords[-1]):
+        coords = coords[:-1]
+    return coords if coords.shape[0] >= 3 else None
+
+
 def _pocket_disk_sample_hull_points(
     ligand_atom_xy: list[dict],
     margin_px: float,
@@ -776,9 +948,17 @@ def _pocket_disk_sample_hull_points(
     samples_per_atom: int,
 ) -> np.ndarray:
     """
-    Outer envelope of unions of disks around each atom ≈ smooth “SAS-like” outline in 2D.
-    Convex hull of dense circle samples avoids the straight-edged hull of atom centers alone.
+    Outer envelope around ligand atoms in 2D.
+
+    Prefer the **union-of-disks** boundary (concave, ligand-following). If Shapely is
+    unavailable, fall back to convex hull of dense circle samples (smoother blob).
     """
+    union_pts = _pocket_disk_union_boundary_points(
+        ligand_atom_xy, margin_px, atom_radius_px
+    )
+    if union_pts is not None and union_pts.shape[0] >= 3:
+        return union_pts
+
     atoms = np.array([[float(p["x"]), float(p["y"])] for p in ligand_atom_xy], dtype=float)
     n_atom = atoms.shape[0]
     if n_atom == 0:
@@ -916,6 +1096,154 @@ def _closed_hull_curve_to_svg_path(curve: np.ndarray) -> str:
         parts.append(f"L {xs[i]:.1f} {ys[i]:.1f}")
     parts.append("Z")
     return " ".join(parts)
+
+
+def _cyclic_draw_segments_from_mask(curve: np.ndarray, draw: np.ndarray) -> list[np.ndarray]:
+    """
+    Split a closed polyline into open segments where draw[i] is True (curve vertex order).
+    Used to leave an angular 'entrance' gap in the pocket outline (Maestro LID).
+    """
+    n = curve.shape[0]
+    if n < 2 or draw.shape[0] != n:
+        return []
+    if np.all(draw):
+        return [curve]
+    segs: list[np.ndarray] = []
+    for i in range(n):
+        if not draw[i] or draw[(i - 1) % n]:
+            continue
+        idxs: list[int] = []
+        j = i
+        for _ in range(n + 2):
+            if not draw[j]:
+                break
+            idxs.append(j)
+            j = (j + 1) % n
+            if j == i and idxs:
+                break
+        if len(idxs) >= 2:
+            segs.append(curve[np.array(idxs, dtype=int)])
+    return segs
+
+
+def pocket_outline_paths_maestro(
+    ligand_atom_xy: list[dict],
+    lig_center: np.ndarray,
+    residue_xy: list[tuple[float, float]],
+    margin_px: float = 14.0,
+    atom_radius_px: float = 9.0,
+    samples_per_atom: int = 26,
+    curve_eval_points: int = 320,
+    closed_spline_s: float = 0.12,
+    entrance_gap_deg: float = 34.0,
+) -> tuple[list[str], str]:
+    """
+    Curved pocket boundary as one or more open paths (dotted stroke in the frontend).
+    Omits an arc toward the solvent — gap faces away from the mean residue direction
+    (Nature / Maestro LID-style entrance).
+    Returns (list of SVG path d strings, legacy single string for backward compatibility).
+    """
+    if not ligand_atom_xy:
+        return [], ""
+    L = np.array([float(lig_center[0]), float(lig_center[1])], dtype=float)
+    res_pts = np.array(residue_xy, dtype=float) if residue_xy else np.zeros((0, 2), dtype=float)
+
+    hp = _pocket_disk_sample_hull_points(
+        ligand_atom_xy, margin_px, atom_radius_px, samples_per_atom
+    )
+    if hp.shape[0] < 3:
+        return [], ""
+    curve = _closed_curve_from_hull_polyline(
+        hp, n_eval=curve_eval_points, s_scale=closed_spline_s
+    )
+    if res_pts.shape[0] > 0:
+        v = res_pts.mean(axis=0) - L
+        nv = float(np.linalg.norm(v))
+        if nv > 1e-6:
+            phi = float(np.arctan2(v[1], v[0]) + np.pi)
+        else:
+            phi = -np.pi / 2
+    else:
+        phi = -np.pi / 2
+
+    half = np.deg2rad(max(float(entrance_gap_deg), 8.0) * 0.5)
+    in_gap = np.zeros(curve.shape[0], dtype=bool)
+    for i in range(curve.shape[0]):
+        P = curve[i] - L
+        ai = float(np.arctan2(P[1], P[0]))
+        d = (ai - phi + np.pi) % (2.0 * np.pi) - np.pi
+        in_gap[i] = abs(d) <= half
+
+    draw = ~in_gap
+    if not np.any(draw):
+        draw = np.ones(curve.shape[0], dtype=bool)
+
+    raw_segs = _cyclic_draw_segments_from_mask(curve, draw)
+    paths: list[str] = []
+    for seg in raw_segs:
+        p = _hull_segment_to_svg_path(seg)
+        if p:
+            paths.append(p)
+
+    if not paths:
+        legacy = _closed_hull_curve_to_svg_path(curve)
+        return ([legacy] if legacy else []), legacy
+
+    legacy = " ".join(paths)
+    return paths, legacy
+
+
+def compute_ligand_atom_solvent_exposure(
+    u: mda.Universe,
+    mol: Chem.Mol,
+    ligand_resname: str,
+    cutoff_angstrom: float = 4.0,
+) -> list[bool]:
+    """
+    Per heavy-atom index (same order as mol without H / ligand_atom_xy): True if no protein
+    heavy atom within cutoff (Maestro-style solvent exposure → gray dots on the 2D ligand).
+    """
+    mol_h = Chem.RemoveHs(Chem.Mol(mol))
+    n_h = mol_h.GetNumAtoms()
+    lig = u.select_atoms(f"resname {ligand_resname}")
+    prot = u.select_atoms("protein")
+    if lig.n_atoms == 0:
+        return [False] * max(n_h, 0)
+    if n_h == 0:
+        return []
+
+    try:
+        pdb_to_rd = map_pdb_ligand_atoms_to_rdkit(u, mol, ligand_resname)
+    except Exception:
+        pdb_to_rd = {}
+    rd_to_pdb = {int(rd): int(pdb) for pdb, rd in pdb_to_rd.items()}
+
+    heavy_full = [
+        i for i in range(mol.GetNumAtoms()) if mol.GetAtomWithIdx(i).GetAtomicNum() != 1
+    ]
+    if len(heavy_full) != n_h:
+        logger.warning(
+            "Ligand heavy-atom count mismatch (mol %d vs RDKit RemoveHs %d); solvent flags off.",
+            len(heavy_full),
+            n_h,
+        )
+        return [False] * n_h
+
+    if prot.n_atoms == 0:
+        return [True] * n_h
+
+    dmat = mda.lib.distances.distance_array(lig.positions, prot.positions)
+    min_d = np.min(dmat, axis=1)
+
+    out: list[bool] = []
+    for k in range(n_h):
+        full_i = heavy_full[k] if k < len(heavy_full) else k
+        pdb_i = rd_to_pdb.get(int(full_i))
+        if pdb_i is None or pdb_i < 0 or pdb_i >= len(min_d):
+            out.append(True)
+        else:
+            out.append(float(min_d[pdb_i]) > float(cutoff_angstrom))
+    return out
 
 
 def pocket_outline_ligand_hug(
@@ -1136,93 +1464,122 @@ def build_diagram(
     u = universe_from_pdb_bytes(selected_pdb_bytes)
     ligand_resname = _resolve_single_ligand_resname(u, ligand_resname)
 
-    # 3) Get pocket residues in angular order
+    # 3) All residues within pocket_radius of the ligand (layout + backbone use this full set)
     res_nodes = place_residues_ring(u, ligand_resname, pocket_radius)
 
-    # 4) Detect interactions with ligand_atom_index anchoring (full mol); remap to heavy-only indices for the frontend
+    # 4) Interactions ranked/filtered for drawing lines (does not remove pocket residues)
     interactions = detect_interactions_atom_anchored(u, mol, ligand_resname, cutoff_contact=4.0)
+    total_interactions = len(interactions)
+    interactions = rank_and_filter_interactions(interactions)
+    logger.debug(
+        "interactions: total=%d filtered=%d | pocket residues (radius=%s Å): %d",
+        total_interactions,
+        len(interactions),
+        pocket_radius,
+        len(res_nodes),
+    )
+
+    # Remap ligand_atom_index to heavy-only indices for the frontend
     for it in interactions:
         rd = it.get("ligand_atom_index")
         if rd is not None and int(rd) >= 0:
             it["ligand_atom_index"] = heavy_rd_index.get(int(rd), -1)
 
-    # 5) Place residue bubbles in sequence order with strong anti-overlap (no overlapping)
+    # 5) Place residues on a loop parallel to the pocket hull (not a uniform circle),
+    #    so the chain follows the binding-site contour and sits just outside the pocket band.
     max_dist = max((n["dist"] for n in res_nodes), default=1.0)
     max_dist = max(max_dist, 1e-6)
 
-    # Wider ring + larger minimum gap (teardrop + 3-line labels; match Maestro-style spacing)
     R_base = 238.0
     R_amp = 118.0
-
-    residues = []
-    placed_positions = []
-
-    rng = np.random.default_rng(7)  # deterministic jitter (minimal so sequence order stays clear)
-    # Center-to-center distance: teardrop glyph + drop shadow + three text lines
     min_node_dist = 76.0
 
-    for n in res_nodes:
-        dynamic_R = R_base + R_amp * (n["dist"] / max_dist)
-        angle = n["angle"] + float(rng.uniform(-0.03, 0.03))  # very small jitter
+    n_res = len(res_nodes)
+    residues = []
+    placed_positions: list[tuple[float, float]] = []
+    rng = np.random.default_rng(7)
 
-        x = float(lig_center[0] + dynamic_R * np.cos(angle))
-        y = float(lig_center[1] + dynamic_R * np.sin(angle))
+    pocket_xy = None
+    if n_res >= 1:
+        pocket_xy = compute_residue_positions_on_pocket_offset(
+            ligand_atom_xy,
+            lig_center,
+            n_res,
+            margin_px=14.0,
+            atom_radius_px=9.0,
+            residue_outward_px=52.0,
+            curve_eval_points=520,
+        )
 
-        # Overlap avoidance: push outward until no overlap with any placed node
-        for _ in range(22):
-            overlap = False
-            for (px, py) in placed_positions:
-                d = float(np.hypot(x - px, y - py))
-                if d < min_node_dist:
-                    overlap = True
-                    break
-            if not overlap:
-                break
-            dynamic_R += 34.0
+    if pocket_xy is not None and pocket_xy.shape[0] == n_res:
+        pocket_xy = _resolve_xy_overlaps(
+            pocket_xy, np.asarray(lig_center, dtype=float), min_node_dist
+        )
+        for i, node in enumerate(res_nodes):
+            x = float(pocket_xy[i, 0])
+            y = float(pocket_xy[i, 1])
+            placed_positions.append((x, y))
+            residues.append({**node, "x": x, "y": y})
+    else:
+        for n in res_nodes:
+            dynamic_R = R_base + R_amp * (n["dist"] / max_dist)
+            angle = n["angle"] + float(rng.uniform(-0.03, 0.03))
+
             x = float(lig_center[0] + dynamic_R * np.cos(angle))
             y = float(lig_center[1] + dynamic_R * np.sin(angle))
 
-        placed_positions.append((x, y))
-        residues.append({**n, "x": x, "y": y, "_angle": angle, "_R": dynamic_R})
-
-    # Second pass: fix any remaining overlaps by pushing nodes outward (keep angle)
-    lig_cx, lig_cy = float(lig_center[0]), float(lig_center[1])
-    for _ in range(16):
-        moved = False
-        for i in range(len(residues)):
-            r_i = residues[i]
-            xi, yi = r_i["x"], r_i["y"]
-            angle_i = r_i["_angle"]
-            R_i = r_i["_R"]
-            for j in range(len(residues)):
-                if i == j:
-                    continue
-                r_j = residues[j]
-                d = float(np.hypot(xi - r_j["x"], yi - r_j["y"]))
-                if d < min_node_dist and d > 1e-6:
-                    R_new = R_i + 36.0
-                    x_new = lig_cx + R_new * np.cos(angle_i)
-                    y_new = lig_cy + R_new * np.sin(angle_i)
-                    residues[i]["x"] = float(x_new)
-                    residues[i]["y"] = float(y_new)
-                    residues[i]["_R"] = R_new
-                    placed_positions[i] = (float(x_new), float(y_new))
-                    moved = True
+            for _ in range(22):
+                overlap = False
+                for (px, py) in placed_positions:
+                    if float(np.hypot(x - px, y - py)) < min_node_dist:
+                        overlap = True
+                        break
+                if not overlap:
                     break
-        if not moved:
-            break
+                dynamic_R += 34.0
+                x = float(lig_center[0] + dynamic_R * np.cos(angle))
+                y = float(lig_center[1] + dynamic_R * np.sin(angle))
 
-    # Drop internal layout fields before returning
+            placed_positions.append((x, y))
+            residues.append({**n, "x": x, "y": y, "_angle": angle, "_R": dynamic_R})
+
+        lig_cx, lig_cy = float(lig_center[0]), float(lig_center[1])
+        for _ in range(16):
+            moved = False
+            for i in range(len(residues)):
+                r_i = residues[i]
+                xi, yi = r_i["x"], r_i["y"]
+                angle_i = r_i["_angle"]
+                R_i = r_i["_R"]
+                for j in range(len(residues)):
+                    if i == j:
+                        continue
+                    r_j = residues[j]
+                    d = float(np.hypot(xi - r_j["x"], yi - r_j["y"]))
+                    if d < min_node_dist and d > 1e-6:
+                        R_new = R_i + 36.0
+                        residues[i]["x"] = float(lig_cx + R_new * np.cos(angle_i))
+                        residues[i]["y"] = float(lig_cy + R_new * np.sin(angle_i))
+                        residues[i]["_R"] = R_new
+                        placed_positions[i] = (residues[i]["x"], residues[i]["y"])
+                        moved = True
+                        break
+            if not moved:
+                break
+
+        for r in residues:
+            r.pop("_angle", None)
+            r.pop("_R", None)
+
     for r in residues:
-        r.pop("_angle", None)
-        r.pop("_R", None)
         r.setdefault("strain_score", 0.0)
 
     # 6) Generate curved backbone path connecting consecutive residues in sequence order
     backbone_path = generate_backbone_path(residues, lig_center)
 
-    # 7) Pocket: full ligand-hugging closed contour (gradient stroke in frontend)
-    outline = pocket_outline_ligand_hug(
+    # 7) Pocket: curved boundary with a visible entrance gap (Maestro / Nature LID style);
+    #    frontend draws dotted stroke over path segment(s).
+    outline_paths, outline_legacy = pocket_outline_paths_maestro(
         ligand_atom_xy,
         lig_center,
         [(float(r["x"]), float(r["y"])) for r in residues],
@@ -1230,17 +1587,25 @@ def build_diagram(
         atom_radius_px=9.0,
         samples_per_atom=26,
         curve_eval_points=320,
-        sector_half_deg=28.0,
-        max_hull_res_dist_px=280.0,
+        entrance_gap_deg=34.0,
     )
+    ligand_atom_solvent_exposed = compute_ligand_atom_solvent_exposure(
+        u, mol, ligand_resname, cutoff_angstrom=4.0
+    )
+    if len(ligand_atom_solvent_exposed) != len(ligand_atom_xy):
+        ligand_atom_solvent_exposed = (ligand_atom_solvent_exposed + [False] * len(ligand_atom_xy))[
+            : len(ligand_atom_xy)
+        ]
 
     return {
         "svg": svg,
         "ligand_center": [float(lig_center[0]), float(lig_center[1])],
         "ligand_atom_xy": ligand_atom_xy,
+        "ligand_atom_solvent_exposed": ligand_atom_solvent_exposed,
         "residues": residues,
         "backbone_path": backbone_path,
-        "pocket_outline_path": outline,
+        "pocket_outline_path": outline_legacy,
+        "pocket_outline_paths": outline_paths,
         "interactions": interactions,
         "meta": {
             "pocket_radius": pocket_radius,
@@ -1251,6 +1616,8 @@ def build_diagram(
             "total_models": total_models,
             "ligand_atoms": int(u.select_atoms(f"resname {ligand_resname}").n_atoms),
             "protein_atoms": int(u.select_atoms("protein").n_atoms),
+            "interaction_total": total_interactions,
+            "interaction_filtered": len(interactions),
         },
         "selected_model": model_index,
         "total_models": total_models,

@@ -9,6 +9,7 @@ from .core.middleware import RequestTimingMiddleware
 from .routes.health import router as health_router
 from .routes.diagram import router as diagram_router
 from .routes.lid import router as lid_router
+from .routes.viz3d import router as viz3d_router
 
 def create_app():
     app = FastAPI(title=settings.APP_NAME)
@@ -23,6 +24,7 @@ def create_app():
     app.include_router(health_router)
     app.include_router(diagram_router)
     app.include_router(lid_router)
+    app.include_router(viz3d_router, prefix="/api")
 
     # Static mount for uploaded PDBs (NGL will load from here)
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
