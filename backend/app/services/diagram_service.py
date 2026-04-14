@@ -307,6 +307,55 @@ def rdkit_full_to_heavy_index_map(mol: Chem.Mol) -> dict[int, int]:
     return m
 
 
+def compute_ligand_atom_solvent_exposed(
+    u: mda.Universe,
+    ligand_resname: str,
+    mol: Chem.Mol,
+    mol_draw: Chem.Mol,
+    min_protein_dist_angstrom: float = 3.45,
+) -> list[bool]:
+    """
+    Per mol_draw atom (same order as ligand_atom_xy): True if that ligand heavy atom is
+    not in tight contact with protein (Maestro-style solvent-exposed marker dots).
+
+    Uses minimum heavy-atom distance to protein; atoms with min_dist > threshold are "exposed".
+    """
+    n_draw = mol_draw.GetNumAtoms()
+    if n_draw == 0:
+        return []
+
+    lig = u.select_atoms(f"resname {ligand_resname}")
+    prot = u.select_atoms("protein")
+    if lig.n_atoms == 0 or prot.n_atoms == 0:
+        return [False] * n_draw
+
+    dmat = mda.lib.distances.distance_array(lig.positions, prot.positions)
+    min_per_pdb = np.min(dmat, axis=1)
+
+    try:
+        pdb_to_rd = map_pdb_ligand_atoms_to_rdkit(u, mol, ligand_resname)
+    except Exception:
+        return [False] * n_draw
+
+    rd_to_pdb = {int(v): int(k) for k, v in pdb_to_rd.items()}
+    full_to_heavy = rdkit_full_to_heavy_index_map(mol)
+    heavy_to_full = {int(hi): int(fi) for fi, hi in full_to_heavy.items()}
+
+    out: list[bool] = []
+    for h in range(n_draw):
+        full_i = heavy_to_full.get(h)
+        if full_i is None:
+            out.append(False)
+            continue
+        pdb_i = rd_to_pdb.get(full_i)
+        if pdb_i is None or pdb_i < 0 or pdb_i >= len(min_per_pdb):
+            out.append(False)
+            continue
+        md = float(min_per_pdb[pdb_i])
+        out.append(md > float(min_protein_dist_angstrom))
+    return out
+
+
 def normalize_to_svg_coords(xy: np.ndarray, svg_w: int, svg_h: int, pad: int = 160) -> np.ndarray:
     """
     Increased pad shrinks ligand so it fits more nicely inside pocket.
@@ -1029,7 +1078,7 @@ def _buried_mask_for_pocket_points(
     return buried
 
 
-def _circular_runs(mask: np.ndarray) -> list[list[int]]:
+def _circular_runs(mask: np.ndarray, link_wrapped_ends: bool = True) -> list[list[int]]:
     n = int(mask.size)
     idx_b = np.where(mask)[0]
     if len(idx_b) == 0:
@@ -1045,7 +1094,10 @@ def _circular_runs(mask: np.ndarray) -> list[list[int]]:
             runs.append(cur)
             cur = [this_i]
     runs.append(cur)
-    if len(runs) >= 2:
+    if (
+        link_wrapped_ends
+        and len(runs) >= 2
+    ):
         first, last = runs[0], runs[-1]
         if first[0] == 0 and last[-1] == n - 1:
             runs[-1] = last + first
@@ -1098,35 +1150,61 @@ def _closed_hull_curve_to_svg_path(curve: np.ndarray) -> str:
     return " ".join(parts)
 
 
-def _cyclic_draw_segments_from_mask(curve: np.ndarray, draw: np.ndarray) -> list[np.ndarray]:
+def pocket_outline_paths_ligand_hug(
+    ligand_atom_xy: list[dict],
+    lig_center: np.ndarray,
+    residue_xy: list[tuple[float, float]],
+    margin_px: float = 12.0,
+    atom_radius_px: float = 9.0,
+    samples_per_atom: int = 26,
+    curve_eval_points: int = 320,
+    closed_spline_s: float = 0.12,
+    sector_half_deg: float = 28.0,
+    max_hull_res_dist_px: float = 280.0,
+    continuous_band: bool = True,
+) -> list[str]:
     """
-    Split a closed polyline into open segments where draw[i] is True (curve vertex order).
-    Used to leave an angular 'entrance' gap in the pocket outline (Maestro LID).
+    Pocket boundary as one or more SVG path strings (Maestro-style: with continuous_band=False,
+    segments skip solvent-facing arcs so the dashed outline shows a visible pocket entrance gap).
     """
-    n = curve.shape[0]
-    if n < 2 or draw.shape[0] != n:
+    if not ligand_atom_xy:
         return []
-    if np.all(draw):
-        return [curve]
-    segs: list[np.ndarray] = []
-    for i in range(n):
-        if not draw[i] or draw[(i - 1) % n]:
+    L = np.array([float(lig_center[0]), float(lig_center[1])], dtype=float)
+    res_pts = np.array(residue_xy, dtype=float) if residue_xy else np.zeros((0, 2), dtype=float)
+
+    hp = _pocket_disk_sample_hull_points(ligand_atom_xy, margin_px, atom_radius_px, samples_per_atom)
+    if hp.shape[0] < 3:
+        return []
+
+    curve = _closed_curve_from_hull_polyline(hp, n_eval=curve_eval_points, s_scale=closed_spline_s)
+
+    if continuous_band:
+        return [_closed_hull_curve_to_svg_path(curve)]
+
+    if res_pts.shape[0] == 0:
+        buried = np.ones(curve.shape[0], dtype=bool)
+    else:
+        buried = _buried_mask_for_pocket_points(curve, L, res_pts, sector_half_deg, max_hull_res_dist_px)
+
+    if not np.any(buried):
+        return [_closed_hull_curve_to_svg_path(curve)]
+
+    runs = _circular_runs(buried)
+    path_chunks: list[str] = []
+    for run in runs:
+        if len(run) < 2:
             continue
-        idxs: list[int] = []
-        j = i
-        for _ in range(n + 2):
-            if not draw[j]:
-                break
-            idxs.append(j)
-            j = (j + 1) % n
-            if j == i and idxs:
-                break
-        if len(idxs) >= 2:
-            segs.append(curve[np.array(idxs, dtype=int)])
-    return segs
+        pts = curve[np.array(run, dtype=int)]
+        chunk = _hull_segment_to_svg_path(pts)
+        if chunk:
+            path_chunks.append(chunk)
+
+    if path_chunks:
+        return path_chunks
+    return [_closed_hull_curve_to_svg_path(curve)]
 
 
-def pocket_outline_paths_maestro(
+def pocket_outline_paths_maestro_entrance_gap(
     ligand_atom_xy: list[dict],
     lig_center: np.ndarray,
     residue_xy: list[tuple[float, float]],
@@ -1135,115 +1213,61 @@ def pocket_outline_paths_maestro(
     samples_per_atom: int = 26,
     curve_eval_points: int = 320,
     closed_spline_s: float = 0.12,
-    entrance_gap_deg: float = 34.0,
-) -> tuple[list[str], str]:
+    gap_half_deg: float = 26.0,
+) -> list[str]:
     """
-    Curved pocket boundary as one or more open paths (dotted stroke in the frontend).
-    Omits an arc toward the solvent — gap faces away from the mean residue direction
-    (Nature / Maestro LID-style entrance).
-    Returns (list of SVG path d strings, legacy single string for backward compatibility).
+    Full ligand-hugging pocket contour split into one or two arcs with a **gap** centered on
+    the direction opposite the pocket residue centroid (Maestro / Nature LID: pocket entrance).
     """
     if not ligand_atom_xy:
-        return [], ""
+        return []
     L = np.array([float(lig_center[0]), float(lig_center[1])], dtype=float)
     res_pts = np.array(residue_xy, dtype=float) if residue_xy else np.zeros((0, 2), dtype=float)
 
-    hp = _pocket_disk_sample_hull_points(
-        ligand_atom_xy, margin_px, atom_radius_px, samples_per_atom
-    )
+    hp = _pocket_disk_sample_hull_points(ligand_atom_xy, margin_px, atom_radius_px, samples_per_atom)
     if hp.shape[0] < 3:
-        return [], ""
-    curve = _closed_curve_from_hull_polyline(
-        hp, n_eval=curve_eval_points, s_scale=closed_spline_s
-    )
-    if res_pts.shape[0] > 0:
-        v = res_pts.mean(axis=0) - L
-        nv = float(np.linalg.norm(v))
-        if nv > 1e-6:
-            phi = float(np.arctan2(v[1], v[0]) + np.pi)
-        else:
-            phi = -np.pi / 2
-    else:
-        phi = -np.pi / 2
-
-    half = np.deg2rad(max(float(entrance_gap_deg), 8.0) * 0.5)
-    in_gap = np.zeros(curve.shape[0], dtype=bool)
-    for i in range(curve.shape[0]):
-        P = curve[i] - L
-        ai = float(np.arctan2(P[1], P[0]))
-        d = (ai - phi + np.pi) % (2.0 * np.pi) - np.pi
-        in_gap[i] = abs(d) <= half
-
-    draw = ~in_gap
-    if not np.any(draw):
-        draw = np.ones(curve.shape[0], dtype=bool)
-
-    raw_segs = _cyclic_draw_segments_from_mask(curve, draw)
-    paths: list[str] = []
-    for seg in raw_segs:
-        p = _hull_segment_to_svg_path(seg)
-        if p:
-            paths.append(p)
-
-    if not paths:
-        legacy = _closed_hull_curve_to_svg_path(curve)
-        return ([legacy] if legacy else []), legacy
-
-    legacy = " ".join(paths)
-    return paths, legacy
-
-
-def compute_ligand_atom_solvent_exposure(
-    u: mda.Universe,
-    mol: Chem.Mol,
-    ligand_resname: str,
-    cutoff_angstrom: float = 4.0,
-) -> list[bool]:
-    """
-    Per heavy-atom index (same order as mol without H / ligand_atom_xy): True if no protein
-    heavy atom within cutoff (Maestro-style solvent exposure → gray dots on the 2D ligand).
-    """
-    mol_h = Chem.RemoveHs(Chem.Mol(mol))
-    n_h = mol_h.GetNumAtoms()
-    lig = u.select_atoms(f"resname {ligand_resname}")
-    prot = u.select_atoms("protein")
-    if lig.n_atoms == 0:
-        return [False] * max(n_h, 0)
-    if n_h == 0:
         return []
 
-    try:
-        pdb_to_rd = map_pdb_ligand_atoms_to_rdkit(u, mol, ligand_resname)
-    except Exception:
-        pdb_to_rd = {}
-    rd_to_pdb = {int(rd): int(pdb) for pdb, rd in pdb_to_rd.items()}
+    curve = _closed_curve_from_hull_polyline(hp, n_eval=curve_eval_points, s_scale=closed_spline_s)
 
-    heavy_full = [
-        i for i in range(mol.GetNumAtoms()) if mol.GetAtomWithIdx(i).GetAtomicNum() != 1
-    ]
-    if len(heavy_full) != n_h:
-        logger.warning(
-            "Ligand heavy-atom count mismatch (mol %d vs RDKit RemoveHs %d); solvent flags off.",
-            len(heavy_full),
-            n_h,
-        )
-        return [False] * n_h
+    if res_pts.shape[0] == 0:
+        return [_closed_hull_curve_to_svg_path(curve)]
 
-    if prot.n_atoms == 0:
-        return [True] * n_h
+    centroid = res_pts.mean(axis=0)
+    v = centroid - L
+    norm = float(np.linalg.norm(v))
+    if norm < 1e-9:
+        return [_closed_hull_curve_to_svg_path(curve)]
 
-    dmat = mda.lib.distances.distance_array(lig.positions, prot.positions)
-    min_d = np.min(dmat, axis=1)
+    # Opening toward bulk solvent: opposite the in-pocket residue cluster.
+    # Carve indices (not just angles) so the gap always appears in the polyline samples.
+    gap_center = float(np.arctan2(v[1], v[0]) + np.pi)
+    ang = np.arctan2(curve[:, 1] - L[1], curve[:, 0] - L[0])
+    da = (ang - gap_center + np.pi) % (2.0 * np.pi) - np.pi
+    i_c = int(np.argmin(np.abs(da)))
+    n = int(curve.shape[0])
+    # Total removed arc ~2*gap_half_deg around the pocket entrance
+    width = max(12, int(n * (2.0 * float(gap_half_deg) / 360.0)))
+    width = min(width, max(8, n // 2 - 2))
+    keep = np.ones(n, dtype=bool)
+    for k in range(-width, width + 1):
+        keep[(i_c + k) % n] = False
 
-    out: list[bool] = []
-    for k in range(n_h):
-        full_i = heavy_full[k] if k < len(heavy_full) else k
-        pdb_i = rd_to_pdb.get(int(full_i))
-        if pdb_i is None or pdb_i < 0 or pdb_i >= len(min_d):
-            out.append(True)
-        else:
-            out.append(float(min_d[pdb_i]) > float(cutoff_angstrom))
-    return out
+    if np.all(keep) or not np.any(keep):
+        return [_closed_hull_curve_to_svg_path(curve)]
+
+    # Do not merge head/tail: we need two separate arcs with a real gap between them.
+    runs = _circular_runs(keep, link_wrapped_ends=False)
+    path_chunks: list[str] = []
+    for run in runs:
+        if len(run) < 2:
+            continue
+        pts = curve[np.array(run, dtype=int)]
+        chunk = _hull_segment_to_svg_path(pts)
+        if chunk:
+            path_chunks.append(chunk)
+
+    return path_chunks if path_chunks else [_closed_hull_curve_to_svg_path(curve)]
 
 
 def pocket_outline_ligand_hug(
@@ -1269,40 +1293,20 @@ def pocket_outline_ligand_hug(
     When continuous_band is False, only arc segments with a nearby residue (solvent gaps) are
     drawn, matching the previous behaviour.
     """
-    if not ligand_atom_xy:
-        return ""
-    L = np.array([float(lig_center[0]), float(lig_center[1])], dtype=float)
-    res_pts = np.array(residue_xy, dtype=float) if residue_xy else np.zeros((0, 2), dtype=float)
-
-    hp = _pocket_disk_sample_hull_points(ligand_atom_xy, margin_px, atom_radius_px, samples_per_atom)
-    if hp.shape[0] < 3:
-        return ""
-
-    curve = _closed_curve_from_hull_polyline(hp, n_eval=curve_eval_points, s_scale=closed_spline_s)
-
-    if continuous_band:
-        return _closed_hull_curve_to_svg_path(curve)
-
-    if res_pts.shape[0] == 0:
-        buried = np.ones(curve.shape[0], dtype=bool)
-    else:
-        buried = _buried_mask_for_pocket_points(curve, L, res_pts, sector_half_deg, max_hull_res_dist_px)
-
-    if not np.any(buried):
-        return _closed_hull_curve_to_svg_path(curve)
-
-    runs = _circular_runs(buried)
-    path_chunks: list[str] = []
-    for run in runs:
-        if len(run) < 2:
-            continue
-        pts = curve[np.array(run, dtype=int)]
-        chunk = _hull_segment_to_svg_path(pts)
-        if chunk:
-            path_chunks.append(chunk)
-
-    segmented = " ".join(path_chunks)
-    return segmented if segmented.strip() else _closed_hull_curve_to_svg_path(curve)
+    parts = pocket_outline_paths_ligand_hug(
+        ligand_atom_xy,
+        lig_center,
+        residue_xy,
+        margin_px=margin_px,
+        atom_radius_px=atom_radius_px,
+        samples_per_atom=samples_per_atom,
+        curve_eval_points=curve_eval_points,
+        closed_spline_s=closed_spline_s,
+        sector_half_deg=sector_half_deg,
+        max_hull_res_dist_px=max_hull_res_dist_px,
+        continuous_band=continuous_band,
+    )
+    return " ".join(parts) if parts else ""
 
 
 # =========================
@@ -1577,25 +1581,23 @@ def build_diagram(
     # 6) Generate curved backbone path connecting consecutive residues in sequence order
     backbone_path = generate_backbone_path(residues, lig_center)
 
-    # 7) Pocket: curved boundary with a visible entrance gap (Maestro / Nature LID style);
-    #    frontend draws dotted stroke over path segment(s).
-    outline_paths, outline_legacy = pocket_outline_paths_maestro(
+    # 7) Pocket: dotted boundary with a visible entrance gap (Nature / Maestro LID)
+    residue_xy_list = [(float(r["x"]), float(r["y"])) for r in residues]
+    pocket_outline_paths = pocket_outline_paths_maestro_entrance_gap(
         ligand_atom_xy,
         lig_center,
-        [(float(r["x"]), float(r["y"])) for r in residues],
+        residue_xy_list,
         margin_px=14.0,
         atom_radius_px=9.0,
         samples_per_atom=26,
         curve_eval_points=320,
-        entrance_gap_deg=34.0,
+        gap_half_deg=26.0,
     )
-    ligand_atom_solvent_exposed = compute_ligand_atom_solvent_exposure(
-        u, mol, ligand_resname, cutoff_angstrom=4.0
+    outline = " ".join(pocket_outline_paths) if pocket_outline_paths else ""
+
+    ligand_atom_solvent_exposed = compute_ligand_atom_solvent_exposed(
+        u, ligand_resname, mol, mol_draw, min_protein_dist_angstrom=3.45
     )
-    if len(ligand_atom_solvent_exposed) != len(ligand_atom_xy):
-        ligand_atom_solvent_exposed = (ligand_atom_solvent_exposed + [False] * len(ligand_atom_xy))[
-            : len(ligand_atom_xy)
-        ]
 
     return {
         "svg": svg,
@@ -1604,8 +1606,8 @@ def build_diagram(
         "ligand_atom_solvent_exposed": ligand_atom_solvent_exposed,
         "residues": residues,
         "backbone_path": backbone_path,
-        "pocket_outline_path": outline_legacy,
-        "pocket_outline_paths": outline_paths,
+        "pocket_outline_path": outline,
+        "pocket_outline_paths": pocket_outline_paths,
         "interactions": interactions,
         "meta": {
             "pocket_radius": pocket_radius,

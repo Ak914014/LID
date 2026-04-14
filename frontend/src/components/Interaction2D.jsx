@@ -95,24 +95,23 @@ function Interaction2D({ data }) {
     return map;
   })();
 
-  // Maestro Ligand Interaction Diagram (Nature-style): red acidic, purple basic,
-  // green hydrophobic, blue polar; gly / nucleic / other neutrals as grey.
+  // Nature / Maestro LID–style: red acidic, purple basic, green hydrophobic, blue polar
   const residueFill = (cls) => {
-    if (cls === "negative") return "#dc2626";    // red – Acidic (Asp, Glu)
-    if (cls === "positive") return "#7c3aed";    // purple – Basic (Lys, Arg, His)
+    if (cls === "negative") return "#dc2626";     // red – Acidic (Asp, Glu)
+    if (cls === "positive") return "#7c3aed";   // purple – Basic (Lys, Arg, His)
     if (cls === "hydrophobic") return "#15803d"; // green – Hydrophobic
     if (cls === "polar") return "#2563eb";       // blue – Polar
     if (cls === "cysteine") return "#65a30d";   // yellow-green – Cys
-    if (cls === "glycine") return "#d4d4d8";    // light grey – Gly
+    if (cls === "glycine") return "#d1d5db";    // light grey – Gly
     if (cls === "metal") return "#9ca3af";
-    if (cls === "nucleic") return "#a8a29e";    // DNA/RNA bases
+    if (cls === "nucleic") return "#9ca3af";
     return "#94a3b8";
   };
 
-  const pocketPathList =
+  const pocketPaths =
     Array.isArray(pocket_outline_paths) && pocket_outline_paths.length > 0
-      ? pocket_outline_paths.filter((p) => p && String(p).trim().length > 0)
-      : pocket_outline_path && String(pocket_outline_path).trim().length > 0
+      ? pocket_outline_paths
+      : pocket_outline_path
         ? [pocket_outline_path]
         : [];
 
@@ -187,8 +186,8 @@ function Interaction2D({ data }) {
         <div>
           <h2 className="text-base font-semibold text-slate-900">Ligand interaction diagram</h2>
           <p className="text-xs text-slate-500">
-            Maestro-style layout: 2D ligand in the center, residue disks by chemical class, dotted
-            pocket boundary with entrance gap, gray dots on solvent-exposed ligand atoms.
+            Maestro / Nature–style: 2D ligand structure, residue disks by type, dotted pocket outline
+            with entrance gap, gray dots on solvent‑exposed ligand atoms.
           </p>
         </div>
         <dl className="flex flex-wrap gap-x-6 gap-y-2 text-sm">
@@ -247,18 +246,17 @@ function Interaction2D({ data }) {
             </linearGradient>
           </defs>
 
-          {/* Pocket boundary: curved dotted line with entrance gap (Maestro / Nature LID) */}
-          {pocketPathList.length > 0 ? (
-            <g aria-label="Pocket boundary">
-              {pocketPathList.map((d, pi) => (
+          {/* Pocket boundary: curved dotted line; segment gaps = entrance / solvent (Maestro LID) */}
+          {pocketPaths.length > 0 ? (
+            <g opacity={0.92}>
+              {pocketPaths.map((d, pi) => (
                 <path
                   key={`pocket-${pi}`}
                   d={d}
                   fill="none"
                   stroke="#475569"
-                  strokeWidth={1.75}
-                  strokeDasharray="3.5 4.5"
-                  opacity={0.92}
+                  strokeWidth={2}
+                  strokeDasharray="3 6"
                   strokeLinecap="round"
                   strokeLinejoin="round"
                 />
@@ -451,27 +449,7 @@ function Interaction2D({ data }) {
             return connections;
           })()}
 
-          {/* Solvent-exposed ligand atoms — after interaction lines so dots stay visible (Maestro LID) */}
-          {ligand_atom_xy &&
-          Array.isArray(ligand_atom_solvent_exposed) &&
-          ligand_atom_solvent_exposed.length === ligand_atom_xy.length
-            ? ligand_atom_xy.map((p, i) =>
-                ligand_atom_solvent_exposed[i] ? (
-                  <circle
-                    key={`solvent-${i}`}
-                    cx={p.x}
-                    cy={p.y}
-                    r={2.8}
-                    fill="#94a3b8"
-                    stroke="#64748b"
-                    strokeWidth={0.35}
-                    opacity={0.92}
-                  />
-                ) : null
-              )
-            : null}
-
-          {/* Residue nodes — perfect disks, class-colored (Maestro LID) */}
+          {/* Residue nodes — perfect circles, colored by type */}
           {positionedResidues.map((r, i) => {
 
 
@@ -479,7 +457,8 @@ function Interaction2D({ data }) {
   const isNucleic = r.class === "nucleic";
 
   const fillColor = residueFill(r.class);
-  const strokeColor = isGlycine || isNucleic ? "#57534e" : "#1e293b";
+  const strokeColor = isGlycine || isNucleic ? "#57534e" : "#0f172a";
+  const strokeW = isGlycine || isNucleic ? 1 : 1.1;
 
   const raw = (r.resname || "").toUpperCase();
 
@@ -497,7 +476,7 @@ function Interaction2D({ data }) {
       ? `${Number(scoreRaw) >= 0 ? "+" : ""}${Number(scoreRaw).toFixed(3)}`
       : "+0.000";
 
-  const nodeR = 13;
+  const nodeR = 11;
 
   return (
     <g key={i}>
@@ -507,14 +486,13 @@ function Interaction2D({ data }) {
         r={nodeR}
         fill={fillColor}
         stroke={strokeColor}
-        strokeWidth={isGlycine || isNucleic ? 0.9 : 1.1}
-        style={{ filter: "drop-shadow(0 1px 2px rgba(0,0,0,0.14))" }}
+        strokeWidth={strokeW}
+        style={{ filter: "drop-shadow(0 1px 2px rgba(0,0,0,0.1))" }}
       />
 
-      {/* 🔤 Residue Name */}
       <text
         x={r.x}
-        y={r.y - nodeR - 5}
+        y={r.y - nodeR - 4}
         textAnchor="middle"
         fontSize="9"
         fill="#0f172a"
@@ -524,7 +502,6 @@ function Interaction2D({ data }) {
         {resnameDisplay}
       </text>
 
-      {/* 📊 Score */}
       <text
         x={r.x}
         y={r.y + 3}
@@ -537,7 +514,6 @@ function Interaction2D({ data }) {
         {scoreStr}
       </text>
 
-      {/* 🔢 Residue Number */}
       <text
         x={r.x}
         y={r.y + nodeR + 10}
@@ -552,6 +528,26 @@ function Interaction2D({ data }) {
     </g>
   );
 })}
+
+          {/* Solvent-exposed ligand atoms: small gray dots on top (Maestro / Nature LID) */}
+          {Array.isArray(ligand_atom_xy) &&
+          Array.isArray(ligand_atom_solvent_exposed) &&
+          ligand_atom_solvent_exposed.length === ligand_atom_xy.length
+            ? ligand_atom_xy.map((p, i) =>
+                ligand_atom_solvent_exposed[i] ? (
+                  <circle
+                    key={`solvent-${i}`}
+                    cx={p.x}
+                    cy={p.y}
+                    r={3.2}
+                    fill="#94a3b8"
+                    stroke="#64748b"
+                    strokeWidth={0.35}
+                    opacity={0.95}
+                  />
+                ) : null
+              )
+            : null}
         </svg>
       </div>
 
@@ -593,12 +589,12 @@ function Interaction2D({ data }) {
         className="mt-6 grid gap-6 border-t border-slate-200 pt-6 text-sm sm:grid-cols-2 lg:grid-cols-3"
         style={{ fontSize: 13 }}
       >
-        {/* Column 1: Residue types (Maestro LID) */}
+        {/* Column 1: Residue types (Nature / Maestro LID palette) */}
         <div>
           <div style={{ fontWeight: "600", marginBottom: "6px", color: "#374151" }}>Residue types</div>
           <LegendItem color="#dc2626" label="Acidic (Asp, Glu)" />
           <LegendItem color="#7c3aed" label="Basic (Lys, Arg, His)" />
-          <LegendItem color="#d4d4d8" label="Glycine" borderColor="#57534e" />
+          <LegendItem color="#d1d5db" label="Glycine" borderColor="#57534e" />
           <LegendItem color="#15803d" label="Hydrophobic" />
           <LegendItem color="#65a30d" label="Cysteine" />
           <LegendItem color="#9ca3af" label="Metal" />
@@ -618,6 +614,7 @@ function Interaction2D({ data }) {
         {/* Column 3: Interaction types (Maestro LID–style: green π–π, red π–cation, purple metal, red–blue salt bridge, yellow halogen) */}
         <div>
           <div style={{ fontWeight: "600", marginBottom: "6px", color: "#374151" }}>Interaction types</div>
+          <LegendItem color="#475569" label="Pocket boundary (dotted)" line dashed />
           <LegendItem color="#64748b" label="Contact (proximity)" line dashed />
           <LegendItem color="#22c55e" label="Distance" line dashed />
           <LegendItem color="#eab308" label="Halogen bond" line arrow />
