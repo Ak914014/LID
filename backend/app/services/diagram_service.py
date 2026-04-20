@@ -25,8 +25,9 @@ logger = logging.getLogger(__name__)
 
 NEG_RES = {"ASP", "GLU"}
 POS_RES = {"ARG", "LYS", "HIS"}
-HYDROPHOBIC_RES = {"VAL", "LEU", "ILE", "ALA", "MET", "PHE", "TRP", "PRO"}
-POLAR_RES = {"ASN", "GLN", "SER", "THR", "TYR"}  # CYS classified separately (Maestro-style)
+# Maestro LID commonly colors TYR with hydrophobic / aromatic greens (not polar blue).
+HYDROPHOBIC_RES = {"VAL", "LEU", "ILE", "ALA", "MET", "PHE", "TRP", "PRO", "TYR"}
+POLAR_RES = {"ASN", "GLN", "SER", "THR"}  # CYS classified separately (Maestro-style)
 
 NUCLEIC_RES = {
     "A", "T", "G", "C", "U",
@@ -855,17 +856,64 @@ def _smooth_backbone_subpath_from_points(pts_array: np.ndarray) -> str:
     return path_d
 
 
+def _backbone_quad_control_xy(
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    lig_center: np.ndarray,
+    curve_offset: float = 22.0,
+) -> tuple[float, float]:
+    """Same bulge heuristic as the 2D client: midpoint + perpendicular offset from ligand center."""
+    lcx, lcy = float(lig_center[0]), float(lig_center[1])
+    mx = (x0 + x1) * 0.5
+    my = (y0 + y1) * 0.5
+    dx = x1 - x0
+    dy = y1 - y0
+    length = float(np.hypot(dx, dy)) or 1.0
+    perp_x = -dy / length
+    perp_y = dx / length
+    from_lig_x = mx - lcx
+    from_lig_y = my - lcy
+    outward = 1.0 if (perp_x * from_lig_x + perp_y * from_lig_y) >= 0 else -1.0
+    cx = mx + perp_x * float(curve_offset) * outward
+    cy = my + perp_y * float(curve_offset) * outward
+    return cx, cy
+
+
+def _quad_bezier_point(t: float, p0: np.ndarray, p1: np.ndarray, p2: np.ndarray) -> tuple[float, float]:
+    omt = 1.0 - float(t)
+    t = float(t)
+    x = omt * omt * p0[0] + 2.0 * omt * t * p1[0] + t * t * p2[0]
+    y = omt * omt * p0[1] + 2.0 * omt * t * p1[1] + t * t * p2[1]
+    return float(x), float(y)
+
+
 def generate_backbone_path(residues, lig_center):
     """
-    Generate smooth curved backbone strokes for sequence-contiguous segments only.
+    Smooth backbone for sequence runs (N→N+1).
 
-    Residues are grouped by chain, sorted by resid, then split into maximal runs where
-    each step is resid N → N+1. Each run is drawn as its own SVG subpath (new ``M``).
-    Gaps in sequence (e.g. …185, 187… or …187, 200…) break the line — a single spline
-    must not bridge across missing residues.
+    If two displayed residues differ by **exactly 2** in sequence number (one missing index,
+    e.g. …291, 293…), a short quadratic bridge plus **one** gap dot is drawn. If the skip is
+    **larger than 2**, the backbone is **not** bridged (line breaks).
+    """
+    _path, _dots = generate_backbone_path_and_gap_dots(residues, lig_center)
+    return _path
+
+
+def generate_backbone_path_and_gap_dots(
+    residues: list[dict],
+    lig_center: np.ndarray,
+) -> tuple[str, list[dict[str, float]]]:
+    """
+    Returns (svg_path, gap_dot_positions).
+
+    Gap dots appear only when ``next_resid - prev_resid == 2`` (single missing residue number).
     """
     if not residues or len(residues) < 2:
-        return ""
+        return "", []
+
+    L = np.asarray(lig_center, dtype=float).reshape(2)
 
     residues_by_chain: dict = {}
     for r in residues:
@@ -875,6 +923,7 @@ def generate_backbone_path(residues, lig_center):
         residues_by_chain.setdefault(chain, []).append(r)
 
     subpaths: list[str] = []
+    gap_dots: list[dict[str, float]] = []
 
     for chain in sorted(residues_by_chain.keys()):
         chain_residues = sorted(
@@ -888,17 +937,39 @@ def generate_backbone_path(residues, lig_center):
         for i in range(1, len(chain_residues)):
             prev_id = int(chain_residues[i - 1].get("resid", 0))
             curr_id = int(chain_residues[i].get("resid", 0))
-            if curr_id - prev_id != 1:
-                segment = chain_residues[run_start:i]
-                if len(segment) >= 2:
-                    pts = [
-                        (float(r["x"]), float(r["y"]))
-                        for r in segment
-                        if "x" in r and "y" in r
-                    ]
-                    if len(pts) >= 2:
-                        subpaths.append(_smooth_backbone_subpath_from_points(np.array(pts, dtype=float)))
-                run_start = i
+            if curr_id - prev_id == 1:
+                continue
+
+            segment = chain_residues[run_start:i]
+            if len(segment) >= 2:
+                pts = [
+                    (float(r["x"]), float(r["y"]))
+                    for r in segment
+                    if "x" in r and "y" in r
+                ]
+                if len(pts) >= 2:
+                    subpaths.append(_smooth_backbone_subpath_from_points(np.array(pts, dtype=float)))
+
+            # Single-number skip only: N and N+2 present (difference == 2) → bridge + one dot.
+            # Larger skips break the backbone (no connector).
+            step = int(curr_id - prev_id)
+            if step == 2:
+                ra = chain_residues[i - 1]
+                rb = chain_residues[i]
+                if "x" in ra and "y" in ra and "x" in rb and "y" in rb:
+                    x0, y0 = float(ra["x"]), float(ra["y"])
+                    x1, y1 = float(rb["x"]), float(rb["y"])
+                    cx, cy = _backbone_quad_control_xy(x0, y0, x1, y1, L, curve_offset=22.0)
+                    subpaths.append(
+                        f"M {x0:.1f} {y0:.1f} Q {cx:.1f} {cy:.1f} {x1:.1f} {y1:.1f}"
+                    )
+                    p0 = np.array([x0, y0], dtype=float)
+                    p1 = np.array([cx, cy], dtype=float)
+                    p2 = np.array([x1, y1], dtype=float)
+                    gx, gy = _quad_bezier_point(0.5, p0, p1, p2)
+                    gap_dots.append({"x": gx, "y": gy})
+
+            run_start = i
 
         segment = chain_residues[run_start:]
         if len(segment) >= 2:
@@ -910,7 +981,7 @@ def generate_backbone_path(residues, lig_center):
             if len(pts) >= 2:
                 subpaths.append(_smooth_backbone_subpath_from_points(np.array(pts, dtype=float)))
 
-    return " ".join(p for p in subpaths if p)
+    return " ".join(p for p in subpaths if p), gap_dots
 
 
 def pocket_outline_path(res_nodes, center_xy, base_r=190, thickness=55):
@@ -1317,11 +1388,114 @@ def is_backbone_atom(atom_name: str) -> bool:
     return atom_name.strip().upper() in {"N", "CA", "C", "O", "OXT"}
 
 
+_POLAR_ELEMS = {"N", "O", "S"}
+_HBOND_ELEMS = {"N", "O", "S", "F"}
+_HYDROPHOBIC_ELEMS = {"C", "S", "F", "CL", "BR", "I"}
+
+# Rough protein-side H-bond atom-role inference by atom name
+_PROT_HBOND_DONOR_PREFIXES = (
+    "N", "NE", "NH", "NZ", "ND", "OG", "OH", "SG"
+)
+_PROT_HBOND_ACCEPTOR_PREFIXES = (
+    "O", "OD", "OE", "OG", "OH", "SD", "ND1", "NE2"
+)
+
+
+def _norm_elem(atom) -> str:
+    elem = (getattr(atom, "element", None) or "").strip().upper()
+    if elem:
+        return elem
+    # PDBs are often messy; fall back to atom-name first letter.
+    return (getattr(atom, "name", "")[:1] or "").strip().upper()
+
+
+def _is_protein_hbond_donor(atom_name: str) -> bool:
+    n = atom_name.strip().upper()
+    return any(n.startswith(p) for p in _PROT_HBOND_DONOR_PREFIXES)
+
+
+def _is_protein_hbond_acceptor(atom_name: str) -> bool:
+    n = atom_name.strip().upper()
+    return any(n.startswith(p) for p in _PROT_HBOND_ACCEPTOR_PREFIXES)
+
+
+def _best_interaction_type_for_pair(
+    *,
+    min_dist: float,
+    rname: str,
+    prot_atom_name: str,
+    prot_elem: str,
+    lig_elem: str,
+    lig_rd_atom,
+    prolif_hits: set[str],
+) -> str:
+    """
+    Prioritized interaction assignment for the closest ligand-protein atom pair.
+    Priority: salt_bridge > hbond > hydrophobic > contact.
+    """
+    prolif_s = " ".join(sorted(prolif_hits)).lower()
+    lig_charge = int(lig_rd_atom.GetFormalCharge()) if lig_rd_atom is not None else 0
+
+    residue_positive = rname in POS_RES
+    residue_negative = rname in NEG_RES
+    residue_hydrophobic = rname in HYDROPHOBIC_RES
+
+    # --- Salt bridge (charged residue + opposite-charge ligand atom) ---
+    # Keep a permissive fallback if formal charge is unavailable.
+    has_prolif_salt = any(k in prolif_s for k in ("ionic", "salt", "cation", "anion"))
+    opposite_charge_pair = (
+        (residue_positive and lig_charge < 0) or
+        (residue_negative and lig_charge > 0)
+    )
+    charged_fallback = (
+        (residue_positive or residue_negative) and lig_elem in _POLAR_ELEMS
+    )
+    if min_dist <= 4.2 and (opposite_charge_pair or (has_prolif_salt and charged_fallback)):
+        return "salt_bridge"
+
+    # --- Hydrogen bond ---
+    has_prolif_hbond = any(k in prolif_s for k in ("hbond", "hba", "hbd"))
+    prot_can_donate = _is_protein_hbond_donor(prot_atom_name)
+    prot_can_accept = _is_protein_hbond_acceptor(prot_atom_name)
+    lig_can_hbond = lig_elem in _HBOND_ELEMS
+    prot_can_hbond = prot_elem in _HBOND_ELEMS and (prot_can_donate or prot_can_accept)
+    if min_dist <= 3.6 and lig_can_hbond and prot_can_hbond:
+        return "hbond"
+    if has_prolif_hbond and min_dist <= 3.9 and lig_can_hbond and prot_elem in _HBOND_ELEMS:
+        return "hbond"
+
+    # --- Hydrophobic contact ---
+    has_prolif_hydrophobic = "hydroph" in prolif_s
+    if min_dist <= 4.8 and residue_hydrophobic and lig_elem in _HYDROPHOBIC_ELEMS:
+        return "hydrophobic"
+    if has_prolif_hydrophobic and min_dist <= 5.0 and lig_elem in _HYDROPHOBIC_ELEMS:
+        return "hydrophobic"
+
+    return "contact"
+
+
+def _dedupe_interactions_by_residue_closest(interactions: list[dict]) -> list[dict]:
+    """
+    Keep only the closest interaction per residue (chain+resname+resid).
+    """
+    best: dict[tuple[str, str, int], dict] = {}
+    for it in interactions:
+        key = (
+            str(it.get("chain", "A")),
+            str(it.get("resname", "")),
+            int(it.get("resid", -1)),
+        )
+        prev = best.get(key)
+        if prev is None or float(it.get("distance", 1e9)) < float(prev.get("distance", 1e9)):
+            best[key] = it
+    return list(best.values())
+
+
 def detect_interactions_atom_anchored(
     u: mda.Universe,
     mol: Chem.Mol,
     ligand_resname: str,
-    cutoff_contact: float = 4.0
+    cutoff_contact: float = 5.0,
 ):
     lig = u.select_atoms(f"resname {ligand_resname}")
     if lig.n_atoms == 0:
@@ -1371,22 +1545,25 @@ def detect_interactions_atom_anchored(
         prot_atom_name = prot_atom.name.strip()
 
         rd_idx = map_pdb_to_rd.get(lig_i, -1)
+        lig_rd_atom = mol.GetAtomWithIdx(int(rd_idx)) if int(rd_idx) >= 0 else None
 
         rname = res.resname
-        lig_elem = (lig_atom.element or lig_atom.name[0]).strip().upper()
-
-        itype = "contact"
-
-        # Salt bridge proxy: charged residue + polar ligand atom
-        if min_dist <= 4.0 and (rname in POS_RES or rname in NEG_RES) and (lig_elem in {"N", "O"}):
-            itype = "salt_bridge"
-
-        # Hydrophobic proxy
-        elif min_dist <= 4.5 and rname in HYDROPHOBIC_RES and lig_elem in {"C", "S", "F", "CL", "BR", "I"}:
-            itype = "hydrophobic"
+        lig_elem = _norm_elem(lig_atom)
+        prot_elem = _norm_elem(prot_atom)
+        residue_key = f"{rname}{int(res.resid)}"
+        prolif_hits = prolif_by_residue.get(residue_key, set())
+        itype = _best_interaction_type_for_pair(
+            min_dist=min_dist,
+            rname=rname,
+            prot_atom_name=prot_atom_name,
+            prot_elem=prot_elem,
+            lig_elem=lig_elem,
+            lig_rd_atom=lig_rd_atom,
+            prolif_hits=prolif_hits,
+        )
 
         interactions.append({
-            "residue": f"{rname}{int(res.resid)}",
+            "residue": residue_key,
             "resname": rname,
             "resid": int(res.resid),
             "chain": getattr(res, "segid", "") or "A",
@@ -1396,9 +1573,15 @@ def detect_interactions_atom_anchored(
             "ligand_atom_index": int(rd_idx),
             "protein_atom_name": prot_atom_name,
             "backbone": bool(is_backbone_atom(prot_atom_name)),
-            "prolif_match": bool(prolif_by_residue.get(f"{rname}{int(res.resid)}")),
+            "prolif_match": bool(prolif_hits),
         })
 
+    # Defensive dedupe: one interaction per residue, closest wins.
+    interactions = _dedupe_interactions_by_residue_closest(interactions)
+
+    # Stable ordering: strongest types first, then shortest distances.
+    priority = {"salt_bridge": 0, "hbond": 1, "hydrophobic": 2, "contact": 3}
+    interactions.sort(key=lambda it: (priority.get(str(it.get("type")), 99), float(it.get("distance", 1e9))))
     return interactions
 
 
@@ -1472,7 +1655,7 @@ def build_diagram(
     res_nodes = place_residues_ring(u, ligand_resname, pocket_radius)
 
     # 4) Interactions ranked/filtered for drawing lines (does not remove pocket residues)
-    interactions = detect_interactions_atom_anchored(u, mol, ligand_resname, cutoff_contact=4.0)
+    interactions = detect_interactions_atom_anchored(u, mol, ligand_resname, cutoff_contact=5.0)
     total_interactions = len(interactions)
     interactions = rank_and_filter_interactions(interactions)
     logger.debug(
@@ -1578,8 +1761,10 @@ def build_diagram(
     for r in residues:
         r.setdefault("strain_score", 0.0)
 
-    # 6) Generate curved backbone path connecting consecutive residues in sequence order
-    backbone_path = generate_backbone_path(residues, lig_center)
+    # 6) Backbone: contiguous runs + quadratic bridges across missing sequence numbers (gap dots)
+    backbone_path, backbone_gap_dots = generate_backbone_path_and_gap_dots(
+        residues, np.asarray(lig_center, dtype=float).reshape(2)
+    )
 
     # 7) Pocket: dotted boundary with a visible entrance gap (Nature / Maestro LID)
     residue_xy_list = [(float(r["x"]), float(r["y"])) for r in residues]
@@ -1606,6 +1791,7 @@ def build_diagram(
         "ligand_atom_solvent_exposed": ligand_atom_solvent_exposed,
         "residues": residues,
         "backbone_path": backbone_path,
+        "backbone_gap_dots": backbone_gap_dots,
         "pocket_outline_path": outline,
         "pocket_outline_paths": pocket_outline_paths,
         "interactions": interactions,

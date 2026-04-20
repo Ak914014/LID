@@ -5,11 +5,11 @@ Classifies amino acid residues into biochemical classes for color coding.
 
 # Residue classification dictionaries
 HYDROPHOBIC = {
-    "ALA", "VAL", "LEU", "ILE", "PHE", "MET", "PRO", "TRP"
+    "ALA", "VAL", "LEU", "ILE", "PHE", "MET", "PRO", "TRP", "TYR"
 }
 
 POLAR = {
-    "SER", "THR", "ASN", "GLN", "TYR", "CYS"
+    "SER", "THR", "ASN", "GLN", "CYS"
 }
 
 POSITIVE = {

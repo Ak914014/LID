@@ -1,5 +1,9 @@
 import React from "react";
 
+/** Unit teardrop: tip points +local Y (down); rotate so tip aims at ligand center. */
+const TEARDROP_D =
+  "M 0,-11 C 7.2,-11 11.2,-6 11.2,-0.4 C 11.2,6.6 0,14.2 0,14.2 C 0,14.2 -11.2,6.6 -11.2,-0.4 C -11.2,-6 -7.2,-11 0,-11 Z";
+
 const LegendItem = ({ color, label, line, dashed, arrow, borderColor, gradientColors }) => (
   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
     {line ? (
@@ -60,6 +64,7 @@ function Interaction2D({ data }) {
     pocket_outline_path,
     pocket_outline_paths,
     backbone_path,
+    backbone_gap_dots = [],
     meta = {},
     interactions = [],
     ligand_atom_xy,
@@ -95,17 +100,16 @@ function Interaction2D({ data }) {
     return map;
   })();
 
-  // Nature / Maestro LID–style: red acidic, purple basic, green hydrophobic, blue polar
-  const residueFill = (cls) => {
-    if (cls === "negative") return "#dc2626";     // red – Acidic (Asp, Glu)
-    if (cls === "positive") return "#7c3aed";   // purple – Basic (Lys, Arg, His)
-    if (cls === "hydrophobic") return "#15803d"; // green – Hydrophobic
-    if (cls === "polar") return "#2563eb";       // blue – Polar
-    if (cls === "cysteine") return "#65a30d";   // yellow-green – Cys
-    if (cls === "glycine") return "#d1d5db";    // light grey – Gly
-    if (cls === "metal") return "#9ca3af";
-    if (cls === "nucleic") return "#9ca3af";
-    return "#94a3b8";
+  const residueGradientId = (cls) => {
+    if (cls === "negative") return "lidGradNegative";
+    if (cls === "positive") return "lidGradPositive";
+    if (cls === "hydrophobic") return "lidGradHydrophobic";
+    if (cls === "polar") return "lidGradPolar";
+    if (cls === "cysteine") return "lidGradCys";
+    if (cls === "glycine") return "lidGradGly";
+    if (cls === "metal") return "lidGradMetal";
+    if (cls === "nucleic") return "lidGradNucleic";
+    return "lidGradOther";
   };
 
   const pocketPaths =
@@ -127,7 +131,6 @@ function Interaction2D({ data }) {
           dash: isBackbone ? "" : "4 2",
           markerEnd: "url(#arrowMagenta)",
           opacity: 0.95,
-          label: isBackbone ? "backbone" : "sidechain"
         };
       }
       case "pi_pi":
@@ -186,8 +189,8 @@ function Interaction2D({ data }) {
         <div>
           <h2 className="text-base font-semibold text-slate-900">Ligand interaction diagram</h2>
           <p className="text-xs text-slate-500">
-            Maestro / Nature–style: 2D ligand structure, residue disks by type, dotted pocket outline
-            with entrance gap, gray dots on solvent‑exposed ligand atoms.
+            Maestro-style LID: 2D ligand, teardrop residues toward the ligand, gradient pocket band with
+            entrance gap, dotted backbone, magenta H-bond arrows, solvent-exposure markers.
           </p>
         </div>
         <dl className="flex flex-wrap gap-x-6 gap-y-2 text-sm">
@@ -244,38 +247,129 @@ function Interaction2D({ data }) {
               <stop offset="0%" stopColor="#dc2626" />
               <stop offset="100%" stopColor="#2563eb" />
             </linearGradient>
+            {/* Pocket band (Maestro: green → yellow → cyan glow) */}
+            <linearGradient id="pocketBandGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stopColor="#4ade80" />
+              <stop offset="42%" stopColor="#facc15" />
+              <stop offset="100%" stopColor="#38bdf8" />
+            </linearGradient>
+            {/* Residue “bubble” lighting (top highlight → deeper base) */}
+            <linearGradient id="lidGradHydrophobic" x1="0" y1="0" x2="0" y2="1" gradientUnits="objectBoundingBox">
+              <stop offset="0%" stopColor="#86efac" />
+              <stop offset="55%" stopColor="#22c55e" />
+              <stop offset="100%" stopColor="#15803d" />
+            </linearGradient>
+            <linearGradient id="lidGradPolar" x1="0" y1="0" x2="0" y2="1" gradientUnits="objectBoundingBox">
+              <stop offset="0%" stopColor="#bae6fd" />
+              <stop offset="55%" stopColor="#38bdf8" />
+              <stop offset="100%" stopColor="#0284c7" />
+            </linearGradient>
+            <linearGradient id="lidGradPositive" x1="0" y1="0" x2="0" y2="1" gradientUnits="objectBoundingBox">
+              <stop offset="0%" stopColor="#c4b5fd" />
+              <stop offset="55%" stopColor="#7c3aed" />
+              <stop offset="100%" stopColor="#5b21b6" />
+            </linearGradient>
+            <linearGradient id="lidGradNegative" x1="0" y1="0" x2="0" y2="1" gradientUnits="objectBoundingBox">
+              <stop offset="0%" stopColor="#fda4af" />
+              <stop offset="55%" stopColor="#f43f5e" />
+              <stop offset="100%" stopColor="#be123c" />
+            </linearGradient>
+            <linearGradient id="lidGradCys" x1="0" y1="0" x2="0" y2="1" gradientUnits="objectBoundingBox">
+              <stop offset="0%" stopColor="#d9f99d" />
+              <stop offset="100%" stopColor="#65a30d" />
+            </linearGradient>
+            <linearGradient id="lidGradGly" x1="0" y1="0" x2="0" y2="1" gradientUnits="objectBoundingBox">
+              <stop offset="0%" stopColor="#f9fafb" />
+              <stop offset="100%" stopColor="#d1d5db" />
+            </linearGradient>
+            <linearGradient id="lidGradMetal" x1="0" y1="0" x2="0" y2="1" gradientUnits="objectBoundingBox">
+              <stop offset="0%" stopColor="#e5e7eb" />
+              <stop offset="100%" stopColor="#9ca3af" />
+            </linearGradient>
+            <linearGradient id="lidGradNucleic" x1="0" y1="0" x2="0" y2="1" gradientUnits="objectBoundingBox">
+              <stop offset="0%" stopColor="#e5e7eb" />
+              <stop offset="100%" stopColor="#9ca3af" />
+            </linearGradient>
+            <linearGradient id="lidGradOther" x1="0" y1="0" x2="0" y2="1" gradientUnits="objectBoundingBox">
+              <stop offset="0%" stopColor="#f1f5f9" />
+              <stop offset="100%" stopColor="#94a3b8" />
+            </linearGradient>
           </defs>
 
-          {/* Pocket boundary: curved dotted line; segment gaps = entrance / solvent (Maestro LID) */}
+          {/* Pocket boundary: soft glow + dashed gradient band (Maestro LID) */}
           {pocketPaths.length > 0 ? (
-            <g opacity={0.92}>
+            <g style={{ filter: "drop-shadow(0 0 6px rgba(56, 189, 248, 0.45))" }}>
               {pocketPaths.map((d, pi) => (
-                <path
-                  key={`pocket-${pi}`}
-                  d={d}
-                  fill="none"
-                  stroke="#475569"
-                  strokeWidth={2}
-                  strokeDasharray="3 6"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
+                <g key={`pocket-${pi}`} opacity={0.95}>
+                  <path
+                    d={d}
+                    fill="none"
+                    stroke="url(#pocketBandGrad)"
+                    strokeWidth={9}
+                    strokeOpacity={0.22}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                  <path
+                    d={d}
+                    fill="none"
+                    stroke="#334155"
+                    strokeWidth={2.4}
+                    strokeOpacity={0.35}
+                    strokeDasharray="4 9"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                  <path
+                    d={d}
+                    fill="none"
+                    stroke="url(#pocketBandGrad)"
+                    strokeWidth={4.2}
+                    strokeDasharray="4 9"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </g>
               ))}
             </g>
           ) : null}
 
-          {/* Smooth protein backbone (B-spline through consecutive residues — matches pocket geometry from API) */}
+          {/* Smooth protein backbone + bead dashes (Maestro chain) */}
           {backbone_path && String(backbone_path).trim().length > 0 ? (
-            <path
-              d={backbone_path}
-              fill="none"
-              stroke="#0f172a"
-              strokeWidth={2.2}
-              opacity={0.9}
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              style={{ filter: "drop-shadow(0 1px 1px rgba(0,0,0,0.08))" }}
-            />
+            <g>
+              <path
+                d={backbone_path}
+                fill="none"
+                stroke="#0f172a"
+                strokeWidth={3.2}
+                opacity={0.92}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              <path
+                d={backbone_path}
+                fill="none"
+                stroke="#0f172a"
+                strokeWidth={3.2}
+                opacity={0.55}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeDasharray="1 13"
+              />
+              {Array.isArray(backbone_gap_dots) &&
+                backbone_gap_dots.map((p, gi) => (
+                  <circle
+                    key={`bb-gap-${gi}`}
+                    cx={p.x}
+                    cy={p.y}
+                    r={2.8}
+                    fill="#0f172a"
+                    stroke="#0f172a"
+                    strokeWidth={0.4}
+                    opacity={0.92}
+                  />
+                ))}
+            </g>
           ) : null}
 
           {/* Interaction lines: curved from ligand atom to residue, with height spacing */}
@@ -353,20 +447,6 @@ function Interaction2D({ data }) {
                     }
                     return circles;
                   })()}
-                  {it.type === "hbond" && st.label && (
-                    <text
-                      x={midX}
-                      y={midY - 8}
-                      textAnchor="middle"
-                      fontSize="8"
-                      fill="#c026d3"
-                      fontWeight="600"
-                      opacity={0.9}
-                      style={{ textShadow: "0 1px 2px rgba(255,255,255,0.8)" }}
-                    >
-                      {st.label}
-                    </text>
-                  )}
                   {it.type === "distance" && (
                     <text
                       x={midX}
@@ -411,8 +491,10 @@ function Interaction2D({ data }) {
                 const next = chainResidues[i + 1];
                 const currResid = curr.resid || 0;
                 const nextResid = next.resid || 0;
-
-                if (nextResid - currResid !== 1) continue;
+                const gap = nextResid - currResid;
+                if (gap < 1) continue;
+                // Only connect consecutive numbering, or a single skip (N → N+2) with one dot.
+                if (gap !== 1 && gap !== 2) continue;
 
                 const mx = (curr.x + next.x) / 2;
                 const my = (curr.y + next.y) / 2;
@@ -443,91 +525,130 @@ function Interaction2D({ data }) {
                     strokeLinejoin="round"
                   />
                 );
+
+                if (gap === 2) {
+                  const t = 0.5;
+                  const omt = 1 - t;
+                  const gx = omt * omt * curr.x + 2 * omt * t * cxCtrl + t * t * next.x;
+                  const gy = omt * omt * curr.y + 2 * omt * t * cyCtrl + t * t * next.y;
+                  connections.push(
+                    <circle
+                      key={`seq-gap-${chain}-${currResid}-${nextResid}`}
+                      cx={gx}
+                      cy={gy}
+                      r={2.8}
+                      fill="#0f172a"
+                      opacity={0.92}
+                    />
+                  );
+                }
               }
             });
 
             return connections;
           })()}
 
-          {/* Residue nodes — perfect circles, colored by type */}
-          {positionedResidues.map((r, i) => {
+          {/* Residue nodes — Maestro teardrops (tip toward ligand) + horizontal labels */}
+          {ligand_center && ligand_center.length === 2
+            ? positionedResidues.map((r, i) => {
+                const lcx = ligand_center[0];
+                const lcy = ligand_center[1];
+                const dx = lcx - r.x;
+                const dy = lcy - r.y;
+                const deg = (Math.atan2(dy, dx) * 180) / Math.PI - 90;
 
+                const isGlycine = r.class === "glycine";
+                const isNucleic = r.class === "nucleic";
 
-  const isGlycine = r.class === "glycine";
-  const isNucleic = r.class === "nucleic";
+                const strokeColor = isGlycine || isNucleic ? "#57534e" : "#0f172a";
+                const strokeW = isGlycine || isNucleic ? 0.95 : 1.05;
+                const gid = residueGradientId(r.class);
 
-  const fillColor = residueFill(r.class);
-  const strokeColor = isGlycine || isNucleic ? "#57534e" : "#0f172a";
-  const strokeW = isGlycine || isNucleic ? 1 : 1.1;
+                const raw = (r.resname || "").toUpperCase();
 
-  const raw = (r.resname || "").toUpperCase();
+                const resnameDisplay = isNucleic
+                  ? raw.length <= 2
+                    ? raw
+                    : raw.slice(0, 2)
+                  : raw.substring(0, 3);
 
-  const resnameDisplay = isNucleic
-    ? raw.length <= 2
-      ? raw
-      : raw.slice(0, 2)
-    : raw.substring(0, 3);
+                const residNum = r.resid ?? "";
 
-  const residNum = r.resid ?? "";
+                const nameYOffset = 20;
+                const numberYOffset = 24;
 
-  const scoreRaw = r.strain_score;
-  const scoreStr =
-    scoreRaw != null && !Number.isNaN(Number(scoreRaw))
-      ? `${Number(scoreRaw) >= 0 ? "+" : ""}${Number(scoreRaw).toFixed(3)}`
-      : "+0.000";
+                return (
+                  <g key={i}>
+                    <g
+                      transform={`translate(${r.x},${r.y}) rotate(${deg})`}
+                      style={{ filter: "drop-shadow(0 1px 2px rgba(0,0,0,0.14))" }}
+                    >
+                      <path
+                        d={TEARDROP_D}
+                        fill={`url(#${gid})`}
+                        stroke={strokeColor}
+                        strokeWidth={strokeW}
+                        strokeLinejoin="round"
+                      />
+                    </g>
 
-  const nodeR = 11;
+                    <text
+                      x={r.x}
+                      y={r.y - nameYOffset}
+                      textAnchor="middle"
+                      fontSize="9"
+                      fill="#0f172a"
+                      fontWeight="700"
+                      style={{ textShadow: "0 1px 2px rgba(255,255,255,0.85)" }}
+                    >
+                      {resnameDisplay}
+                    </text>
 
-  return (
-    <g key={i}>
-      <circle
-        cx={r.x}
-        cy={r.y}
-        r={nodeR}
-        fill={fillColor}
-        stroke={strokeColor}
-        strokeWidth={strokeW}
-        style={{ filter: "drop-shadow(0 1px 2px rgba(0,0,0,0.1))" }}
-      />
-
-      <text
-        x={r.x}
-        y={r.y - nodeR - 4}
-        textAnchor="middle"
-        fontSize="9"
-        fill="#0f172a"
-        fontWeight="700"
-        style={{ textShadow: "0 1px 2px rgba(255,255,255,0.85)" }}
-      >
-        {resnameDisplay}
-      </text>
-
-      <text
-        x={r.x}
-        y={r.y + 3}
-        textAnchor="middle"
-        fontSize="7.5"
-        fill="#64748b"
-        fontWeight="600"
-        style={{ textShadow: "0 1px 2px rgba(255,255,255,0.85)" }}
-      >
-        {scoreStr}
-      </text>
-
-      <text
-        x={r.x}
-        y={r.y + nodeR + 10}
-        textAnchor="middle"
-        fontSize="8"
-        fill="#334155"
-        fontWeight="700"
-        style={{ textShadow: "0 1px 2px rgba(255,255,255,0.85)" }}
-      >
-        {residNum}
-      </text>
-    </g>
-  );
-})}
+                    <text
+                      x={r.x}
+                      y={r.y + numberYOffset}
+                      textAnchor="middle"
+                      fontSize="8"
+                      fill="#1e293b"
+                      fontWeight="700"
+                      style={{ textShadow: "0 1px 2px rgba(255,255,255,0.85)" }}
+                    >
+                      {residNum}
+                    </text>
+                  </g>
+                );
+              })
+            : positionedResidues.map((r, i) => {
+                const isGlycine = r.class === "glycine";
+                const isNucleic = r.class === "nucleic";
+                const gid = residueGradientId(r.class);
+                const strokeColor = isGlycine || isNucleic ? "#57534e" : "#0f172a";
+                const raw = (r.resname || "").toUpperCase();
+                const resnameDisplay = isNucleic
+                  ? raw.length <= 2
+                    ? raw
+                    : raw.slice(0, 2)
+                  : raw.substring(0, 3);
+                const residNum = r.resid ?? "";
+                return (
+                  <g key={i}>
+                    <circle
+                      cx={r.x}
+                      cy={r.y}
+                      r={11}
+                      fill={`url(#${gid})`}
+                      stroke={strokeColor}
+                      strokeWidth={1.05}
+                    />
+                    <text x={r.x} y={r.y - 20} textAnchor="middle" fontSize="9" fill="#0f172a" fontWeight="700">
+                      {resnameDisplay}
+                    </text>
+                    <text x={r.x} y={r.y + 24} textAnchor="middle" fontSize="8" fill="#1e293b" fontWeight="700">
+                      {residNum}
+                    </text>
+                  </g>
+                );
+              })}
 
           {/* Solvent-exposed ligand atoms: small gray dots on top (Maestro / Nature LID) */}
           {Array.isArray(ligand_atom_xy) &&
@@ -589,21 +710,21 @@ function Interaction2D({ data }) {
         className="mt-6 grid gap-6 border-t border-slate-200 pt-6 text-sm sm:grid-cols-2 lg:grid-cols-3"
         style={{ fontSize: 13 }}
       >
-        {/* Column 1: Residue types (Nature / Maestro LID palette) */}
+        {/* Column 1: Residue types (Maestro LID palette) */}
         <div>
           <div style={{ fontWeight: "600", marginBottom: "6px", color: "#374151" }}>Residue types</div>
-          <LegendItem color="#dc2626" label="Acidic (Asp, Glu)" />
-          <LegendItem color="#7c3aed" label="Basic (Lys, Arg, His)" />
-          <LegendItem color="#d1d5db" label="Glycine" borderColor="#57534e" />
-          <LegendItem color="#15803d" label="Hydrophobic" />
-          <LegendItem color="#65a30d" label="Cysteine" />
+          <LegendItem color="#f43f5e" label="Acidic (Asp, Glu)" />
+          <LegendItem color="#6d28d9" label="Basic (Lys, Arg, His)" />
+          <LegendItem color="#e5e7eb" label="Glycine" borderColor="#57534e" />
+          <LegendItem color="#22c55e" label="Hydrophobic (incl. Tyr)" />
+          <LegendItem color="#84cc16" label="Cysteine" />
           <LegendItem color="#9ca3af" label="Metal" />
         </div>
 
         {/* Column 2: Other */}
         <div>
           <div style={{ fontWeight: "600", marginBottom: "6px", color: "#374151" }}>Other</div>
-          <LegendItem color="#2563eb" label="Polar" />
+          <LegendItem color="#38bdf8" label="Polar" />
           <LegendItem color="#9ca3af" label="DNA / RNA" />
           <LegendItem color="#94a3b8" label="Unspecified residue" />
           <LegendItem color="#ffffff" label="Water" borderColor="#cbd5e1" />
@@ -614,7 +735,12 @@ function Interaction2D({ data }) {
         {/* Column 3: Interaction types (Maestro LID–style: green π–π, red π–cation, purple metal, red–blue salt bridge, yellow halogen) */}
         <div>
           <div style={{ fontWeight: "600", marginBottom: "6px", color: "#374151" }}>Interaction types</div>
-          <LegendItem color="#475569" label="Pocket boundary (dotted)" line dashed />
+          <LegendItem
+            gradientColors={["#4ade80", "#38bdf8"]}
+            label="Pocket boundary (gradient + gap)"
+            line
+            dashed
+          />
           <LegendItem color="#64748b" label="Contact (proximity)" line dashed />
           <LegendItem color="#22c55e" label="Distance" line dashed />
           <LegendItem color="#eab308" label="Halogen bond" line arrow />
